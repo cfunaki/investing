@@ -1,0 +1,24 @@
+[project]
+name = "bravos-trade-sync"
+version = "1.0.0"
+description = "Parse Bravos ideas and reconcile with Robinhood holdings"
+requires-python = ">=3.10"
+dependencies = [
+    "robin_stocks>=3.0.0",
+    "pandas>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "pyotp>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

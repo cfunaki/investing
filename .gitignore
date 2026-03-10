@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Build output
+dist/
+
+# Environment and secrets
+.env
+.env.local
+
+# Session data (contains auth tokens)
+data/sessions/
+
+# Raw scraped data (can be large)
+data/raw/
+
+# Processed data (contains personal holdings)
+data/processed/*.json
+
+# Trade logs (personal)
+data/trades/
+
+# Generated reports
+data/reports/*.md
+data/reports/*.csv
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+*.egg-info/
+.eggs/
+build/
+
+# Logs
+*.log

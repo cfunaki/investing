@@ -1,0 +1,69 @@
+{
+  "_comment": "Configurable selectors for Bravos Research site. Update these when the site structure changes.",
+  "_updated": "2026-03-07",
+
+  "ideasPage": {
+    "url": "https://bravosresearch.com/ideas/",
+    "listContainer": ".ideas-wrapper, .ideas, .idea-posts-table",
+    "ideaRow": ".idea_posts",
+    "ideaClickable": ".title.idea-click, p.idea-click",
+    "ideaSummary": ".title.idea-click span",
+    "ideaPostIds": "[data-posts]",
+    "pagination": {
+      "nextButton": "button:has-text('Next'), a:has-text('Next'), .pagination-next, [aria-label='Next page']",
+      "prevButton": "button:has-text('Previous'), a:has-text('Previous'), .pagination-prev",
+      "pageNumbers": ".pagination a, .page-numbers a",
+      "loadMoreButton": "button:has-text('Load More'), button:has-text('Show More'), .load-more"
+    },
+    "infiniteScroll": {
+      "sentinel": ".infinite-scroll-sentinel, .loading-indicator, .spinner"
+    }
+  },
+
+  "detailPage": {
+    "container": "article, .idea-detail, .journal-entry, main .content, .post-content",
+    "title": "h1, .idea-title, .entry-title, .post-title",
+    "symbol": ".ticker, .symbol, [data-symbol], h1 .stock-symbol",
+    "side": {
+      "buy": ":has-text('Buy'), :has-text('Long'), .buy-indicator, [data-side='buy']",
+      "sell": ":has-text('Sell'), :has-text('Short'), .sell-indicator, [data-side='sell']"
+    },
+    "allocation": {
+      "weight": ".allocation, .weight, .position-size, [data-weight]",
+      "percentage": ".percentage, .pct, [data-pct]"
+    },
+    "prices": {
+      "entry": ".entry-price, [data-entry-price], :has-text('Entry') + span",
+      "target": ".target-price, [data-target-price], :has-text('Target') + span",
+      "stopLoss": ".stop-loss, [data-stop-loss], :has-text('Stop') + span"
+    },
+    "status": {
+      "open": ".status-open, :has-text('Open'), [data-status='open']",
+      "closed": ".status-closed, :has-text('Closed'), [data-status='closed']"
+    },
+    "date": "time, .date, .published-date, [datetime]",
+    "notes": ".notes, .description, .rationale, .content-body, article p"
+  },
+
+  "authIndicators": {
+    "loggedIn": [
+      ".user-menu",
+      ".user-avatar",
+      "[data-testid='user-menu']",
+      "nav a[href*='logout']",
+      "nav a[href*='account']",
+      "body.logged-in"
+    ],
+    "loggedOut": [
+      "form[action*='login']",
+      "input[name='password']",
+      "button:has-text('Sign In')",
+      "button:has-text('Log In')"
+    ]
+  },
+
+  "patterns": {
+    "_comment": "Regex patterns for extracting data from text",
+    "ideaSummary": "^(Long|Short)\\s+on\\s+(.+?)\\s+\\(\\$(\\w+)\\)\\s*(?:-\\s*)?\\[(\\d{2}\\/\\d{2}\\/\\d{4})\\]$"
+  }
+}
