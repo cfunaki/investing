@@ -48,13 +48,14 @@ def get_pending_orders() -> list[dict]:
         return []
 
 
-def execute_sell(symbol: str, quantity: float, dry_run: bool = False) -> dict:
+def execute_sell(symbol: str, quantity: float, amount_dollars: float = None, dry_run: bool = False) -> dict:
     """
     Execute a sell order.
 
     Args:
         symbol: Stock ticker
         quantity: Number of shares to sell
+        amount_dollars: Dollar amount to sell (used for fractional)
         dry_run: If True, don't actually execute
 
     Returns:
@@ -64,12 +65,25 @@ def execute_sell(symbol: str, quantity: float, dry_run: bool = False) -> dict:
         return {"status": "dry_run", "symbol": symbol, "quantity": quantity, "side": "sell"}
 
     try:
-        # Use fractional sell for precision
+        # Try selling by dollar amount first (more reliable for fractional)
+        if amount_dollars and amount_dollars >= 1:
+            result = rh.order_sell_fractional_by_price(
+                symbol=symbol,
+                amountInDollars=round(amount_dollars, 2),
+                timeInForce='gfd',
+            )
+            if result:
+                return result
+
+        # Fall back to quantity-based sell
         result = rh.order_sell_fractional_by_quantity(
             symbol=symbol,
             quantity=quantity,
-            timeInForce='gfd',  # Good for day
+            timeInForce='gfd',
         )
+
+        if result is None:
+            return {"status": "error", "error": "API returned None", "symbol": symbol}
         return result
     except Exception as e:
         return {"status": "error", "error": str(e), "symbol": symbol}
@@ -97,9 +111,12 @@ def execute_buy(symbol: str, amount_dollars: float, dry_run: bool = False) -> di
 
         result = rh.order_buy_fractional_by_price(
             symbol=symbol,
-            amountInDollars=amount_dollars,
+            amountInDollars=round(amount_dollars, 2),
             timeInForce='gfd',  # Good for day
         )
+
+        if result is None:
+            return {"status": "error", "error": "API returned None (rate limited?)", "symbol": symbol}
         return result
     except Exception as e:
         return {"status": "error", "error": str(e), "symbol": symbol}
@@ -166,16 +183,36 @@ def execute_all_trades(dry_run: bool = False, confirm_each: bool = True) -> dict
     for i, sell in enumerate(sells, 1):
         symbol = sell["symbol"]
         holding = holdings_map.get(symbol, {})
-        quantity = holding.get("quantity", 0)
+        full_quantity = holding.get("quantity", 0)
+        current_price = holding.get("current_price", 0)
 
-        if quantity <= 0:
+        if full_quantity <= 0:
             print(f"  [{i}/{len(sells)}] SKIP {symbol} - no shares to sell")
             continue
 
-        value = sell["current_value"]
+        # For "exit" action, sell all shares
+        # For "sell" action (trim), only sell the delta amount
+        if sell["action"] == "exit":
+            quantity = full_quantity
+            value = sell["current_value"]
+        else:
+            # Partial sell - calculate shares from suggested_trade_value
+            sell_value = abs(sell["suggested_trade_value"])
+            if current_price > 0:
+                quantity = sell_value / current_price
+            else:
+                quantity = 0
+            value = sell_value
+
+        if quantity <= 0:
+            print(f"  [{i}/{len(sells)}] SKIP {symbol} - sell amount too small")
+            continue
+
         print(f"\n  [{i}/{len(sells)}] SELL {symbol}")
         print(f"      Quantity: {quantity:.6f} shares")
         print(f"      Value:    ${value:,.2f}")
+        if sell["action"] != "exit":
+            print(f"      (Trimming from {full_quantity:.2f} shares)")
 
         if confirm_each and not dry_run:
             response = input("      Execute? (y/n/q): ").strip().lower()
@@ -186,7 +223,7 @@ def execute_all_trades(dry_run: bool = False, confirm_each: bool = True) -> dict
                 print("      Skipped.")
                 continue
 
-        result = execute_sell(symbol, quantity, dry_run=dry_run)
+        result = execute_sell(symbol, quantity, amount_dollars=value, dry_run=dry_run)
         result["symbol"] = symbol
         result["intended_value"] = value
         result["quantity"] = quantity
@@ -200,7 +237,7 @@ def execute_all_trades(dry_run: bool = False, confirm_each: bool = True) -> dict
             results["errors"].append(result)
 
         if not dry_run:
-            time.sleep(0.5)  # Rate limiting
+            time.sleep(2)  # Rate limiting
 
     # Execute buys
     print(f"\n{'='*60}")
@@ -240,7 +277,7 @@ def execute_all_trades(dry_run: bool = False, confirm_each: bool = True) -> dict
             results["errors"].append(result)
 
         if not dry_run:
-            time.sleep(0.5)  # Rate limiting
+            time.sleep(2)  # Rate limiting
 
     # Summary
     print(f"\n{'='*60}")
@@ -279,16 +316,22 @@ if __name__ == "__main__":
         if sys.argv[1] == "--dry-run":
             execute_all_trades(dry_run=True, confirm_each=False)
         elif sys.argv[1] == "--live":
-            print("WARNING: This will execute REAL trades!")
-            confirm = input("Type 'EXECUTE' to confirm: ")
-            if confirm == "EXECUTE":
-                execute_all_trades(dry_run=False, confirm_each=True)
+            no_confirm = "--no-confirm" in sys.argv
+            if no_confirm:
+                print("WARNING: Executing REAL trades (no-confirm mode)")
+                execute_all_trades(dry_run=False, confirm_each=False)
             else:
-                print("Aborted.")
+                print("WARNING: This will execute REAL trades!")
+                confirm = input("Type 'EXECUTE' to confirm: ")
+                if confirm == "EXECUTE":
+                    execute_all_trades(dry_run=False, confirm_each=True)
+                else:
+                    print("Aborted.")
         elif sys.argv[1] == "--pending":
             show_pending_orders()
     else:
         print("Usage:")
-        print("  --dry-run   Simulate trades without executing")
-        print("  --live      Execute real trades (with confirmation)")
-        print("  --pending   Show pending orders")
+        print("  --dry-run              Simulate trades without executing")
+        print("  --live                 Execute real trades (with confirmation)")
+        print("  --live --no-confirm    Execute without per-trade prompts")
+        print("  --pending              Show pending orders")
