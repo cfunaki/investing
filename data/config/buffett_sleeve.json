@@ -1,0 +1,19 @@
+{
+  "cik": "0001067983",
+  "top_n_positions": 10,
+  "min_portfolio_weight_pct": 3.0,
+  "exclude_cusips": [],
+  "dollars_per_weight": 240,
+  "notes": {
+    "cik": "Berkshire Hathaway CIK",
+    "weight_buckets": {
+      ">=20%": "weight 8 ($4,000)",
+      "15-20%": "weight 7 ($3,500)",
+      "10-15%": "weight 6 ($3,000)",
+      "7-10%": "weight 5 ($2,500)",
+      "5-7%": "weight 4 ($2,000)",
+      "3-5%": "weight 3 ($1,500)",
+      "<3%": "excluded"
+    }
+  }
+}
