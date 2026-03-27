@@ -189,14 +189,17 @@ class TelegramBot:
             lines.append("")
             lines.append("*Details:*")
             for key, value in details.items():
-                lines.append(f"  {key}: {value}")
+                # Escape underscores for Telegram Markdown
+                safe_key = str(key).replace("_", "\\_")
+                safe_value = str(value).replace("_", "\\_")
+                lines.append(f"  {safe_key}: {safe_value}")
 
         lines.extend([
             "",
             "Commands:",
-            "  /review <id> - Inspect details",
-            "  /retry <id> - Re-process signal",
-            "  /dismiss <id> - Discard this alert",
+            "  `/review` - Inspect details",
+            "  `/retry` - Re-process signal",
+            "  `/dismiss` - Discard this alert",
         ])
 
         return "\n".join(lines)
