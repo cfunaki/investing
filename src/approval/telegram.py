@@ -109,6 +109,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("retry", self._cmd_retry))
         app.add_handler(CommandHandler("dismiss", self._cmd_dismiss))
         app.add_handler(CommandHandler("buffett", self._cmd_buffett))
+        app.add_handler(CommandHandler("bravos", self._cmd_bravos))
 
         # Callback query handler for inline buttons
         app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -495,15 +496,19 @@ class TelegramBot:
             "*Approvals:*\n"
             "/pending - List pending approval requests\n"
             "/status - Show system status\n\n"
+            "*Bravos Sleeve:*\n"
+            "/bravos - Show Bravos sleeve status\n"
+            "/bravos check - Check for new email (dry run)\n"
+            "/bravos sync - Check and process new email\n"
+            "/bravos recon - Run on existing data\n\n"
             "*Buffett Sleeve:*\n"
             "/buffett - Show Buffett sleeve status\n"
             "/buffett check - Check for new 13F (dry run)\n"
-            "/buffett sync - Check and process new filing\n"
-            "/buffett force - Force reprocess\n\n"
+            "/buffett sync - Check and process new filing\n\n"
             "*Manual Review:*\n"
-            "/review <id> - Inspect an intent flagged for review\n"
-            "/retry <id> - Re-process a signal\n"
-            "/dismiss <id> - Dismiss a review alert\n\n"
+            "/review - Inspect an intent\n"
+            "/retry - Re-process a signal\n"
+            "/dismiss - Dismiss a review alert\n\n"
             "*Other:*\n"
             "/help - Show this message",
             parse_mode="Markdown",
@@ -734,6 +739,156 @@ class TelegramBot:
 
         except Exception as e:
             logger.exception("buffett_check_failed", error=str(e))
+            await update.message.reply_text(f"Error: {str(e)}")
+
+    # =========================================================================
+    # Bravos Commands
+    # =========================================================================
+
+    async def _cmd_bravos(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle /bravos command - Bravos sleeve management.
+
+        Subcommands:
+            /bravos - Show status
+            /bravos check - Check for new email (dry run)
+            /bravos sync - Check and process (sends approval if new email)
+            /bravos force - Force reprocess
+            /bravos recon - Run reconciliation on existing data
+        """
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            await update.message.reply_text("Unauthorized")
+            return
+
+        args = context.args
+        subcommand = args[0].lower() if args else "status"
+
+        if subcommand == "status":
+            await self._bravos_status(update)
+        elif subcommand == "check":
+            await self._bravos_check(update, dry_run=True)
+        elif subcommand == "sync":
+            await self._bravos_check(update, dry_run=False)
+        elif subcommand == "force":
+            await self._bravos_check(update, dry_run=False, force=True)
+        elif subcommand == "recon":
+            await self._bravos_check(update, dry_run=False, skip_scrape=True)
+        else:
+            await update.message.reply_text(
+                "*Bravos Sleeve Commands*\n\n"
+                "/bravos - Show status\n"
+                "/bravos check - Check for new email (dry run)\n"
+                "/bravos sync - Check and send approval if new email\n"
+                "/bravos force - Force reprocess\n"
+                "/bravos recon - Run on existing data (skip scrape)\n",
+                parse_mode="Markdown",
+            )
+
+    async def _bravos_status(self, update: Update):
+        """Show Bravos sleeve status."""
+        from src.signals.bravos_detector import get_bravos_detector
+
+        detector = get_bravos_detector()
+        status = detector.get_status()
+
+        last_msg_id = status['last_processed_message_id']
+        if last_msg_id:
+            last_msg_id = f"`{last_msg_id[:16]}...`"
+        else:
+            last_msg_id = "Never"
+
+        await update.message.reply_text(
+            f"*Bravos Sleeve Status*\n\n"
+            f"Last Processed: {last_msg_id}\n"
+            f"Last Checked: `{status['last_checked_at'] or 'Never'}`\n"
+            f"Last Processed At: `{status['last_processed_at'] or 'Never'}`\n"
+            f"History Entries: `{status['history_count']}`\n\n"
+            "Commands:\n"
+            "/bravos check - Check for new email\n"
+            "/bravos sync - Process new email",
+            parse_mode="Markdown",
+        )
+
+    async def _bravos_check(
+        self,
+        update: Update,
+        dry_run: bool = True,
+        force: bool = False,
+        skip_scrape: bool = False,
+    ):
+        """Check for new Bravos email and optionally process."""
+        from src.signals.bravos_processor import check_and_process_bravos
+
+        if skip_scrape:
+            mode = "recon only"
+        elif force:
+            mode = "force"
+        elif dry_run:
+            mode = "dry run"
+        else:
+            mode = "live"
+
+        await update.message.reply_text(f"Checking Bravos ({mode})...")
+
+        try:
+            result = await check_and_process_bravos(
+                force=force,
+                dry_run=dry_run,
+                skip_scrape=skip_scrape,
+            )
+
+            if not result.success:
+                await update.message.reply_text(
+                    f"*Check Failed*\n\nError: {result.error}",
+                    parse_mode="Markdown",
+                )
+                return
+
+            if not result.new_email and not force and not skip_scrape:
+                await update.message.reply_text(
+                    f"*No New Email*\n\n"
+                    f"No new Bravos emails detected.",
+                    parse_mode="Markdown",
+                )
+                return
+
+            # Processing triggered
+            lines = [
+                "*Bravos Processing Complete*",
+                "",
+            ]
+
+            if result.subject:
+                lines.append(f"Email: `{result.subject[:30]}...`")
+
+            lines.extend([
+                f"Trades: `{result.trade_count}`",
+                f"Total Buy: `${result.total_buy:,.0f}`",
+                f"Total Sell: `${result.total_sell:,.0f}`",
+            ])
+
+            if dry_run:
+                lines.extend([
+                    "",
+                    "_Dry run - no approval sent._",
+                    "Use `/bravos sync` to send approval request.",
+                ])
+            elif result.approval_sent:
+                lines.extend([
+                    "",
+                    "Approval request sent. Check above for buttons.",
+                ])
+            elif result.trade_count == 0:
+                lines.extend([
+                    "",
+                    "No trades to execute.",
+                ])
+
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+        except Exception as e:
+            logger.exception("bravos_check_failed", error=str(e))
             await update.message.reply_text(f"Error: {str(e)}")
 
     # =========================================================================
