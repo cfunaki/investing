@@ -22,6 +22,10 @@ import structlog
 
 from src.approval.telegram import ApprovalRequest, TelegramBot, generate_approval_code, get_telegram_bot
 from src.config import get_settings
+from src.db.repositories.approval_repository import approval_repository
+from src.db.repositories.reconciliation_repository import reconciliation_repository
+from src.db.repositories.sleeve_repository import sleeve_repository
+from src.db.session import get_db_context
 from src.execution.executor import execute_approved_trades
 from src.signals.models import (
     PortfolioIntent,
@@ -187,11 +191,66 @@ class ApprovalWorkflow:
         settings = get_settings()
 
         approval_code = generate_approval_code()
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=settings.approval_expiry_minutes)
+        requested_at = datetime.now(timezone.utc)
+        expires_at = requested_at + timedelta(minutes=settings.approval_expiry_minutes)
 
-        # Create approval record
+        log = logger.bind(
+            approval_code=approval_code,
+            trades=plan.trade_count,
+            notional=plan.total_notional,
+            sleeve=sleeve_name,
+        )
+
+        # Persist to database: Signal → Intent → Reconciliation → Approval
+        try:
+            async with get_db_context() as db:
+                # Get sleeve from database
+                sleeve = await sleeve_repository.get_by_name(db, sleeve_name)
+                if not sleeve:
+                    log.warning("sleeve_not_found_using_plan_id", sleeve_name=sleeve_name)
+                    sleeve_id = plan.sleeve_id
+                else:
+                    sleeve_id = sleeve.id
+
+                # Create the full chain: Signal → Intent → Reconciliation
+                source_event_id = f"approval_{approval_code}_{requested_at.timestamp()}"
+                signal, intent, recon = await reconciliation_repository.create_full_chain(
+                    db=db,
+                    sleeve_id=sleeve_id,
+                    source_event_id=source_event_id,
+                    event_type="approval_request",
+                    proposed_trades=plan.trades_to_dict(),
+                    holdings_snapshot=plan.holdings_snapshot if hasattr(plan, 'holdings_snapshot') else {},
+                    target_allocations=plan.trades_to_dict(),
+                )
+
+                # Create approval record in database
+                db_approval = await approval_repository.create(
+                    db=db,
+                    reconciliation_id=recon.id,
+                    approval_code=approval_code,
+                    proposed_trades=plan.trades_to_dict(),
+                    requested_at=requested_at,
+                    expires_at=expires_at,
+                )
+                approval_id = db_approval.id
+
+                log = log.bind(
+                    approval_id=str(approval_id),
+                    signal_id=str(signal.id),
+                    recon_id=str(recon.id),
+                )
+                log.info("approval_persisted_to_database")
+
+        except Exception as e:
+            log.exception("failed_to_persist_approval", error=str(e))
+            # Fall back to in-memory only
+            approval_id = uuid4()
+            log.warning("using_in_memory_approval_only")
+
+        # Create in-memory record for session tracking
         record = ApprovalRecord(
-            id=uuid4(),
+            id=approval_id,
             reconciliation_id=plan.id,
             sleeve_id=plan.sleeve_id,
             approval_code=approval_code,
@@ -211,13 +270,6 @@ class ApprovalWorkflow:
             expires_at=expires_at,
         )
 
-        log = logger.bind(
-            approval_id=str(record.id),
-            approval_code=approval_code,
-            trades=plan.trade_count,
-            notional=plan.total_notional,
-        )
-
         # Send to Telegram
         message_id = await self.bot.send_approval_request(request)
 
@@ -228,7 +280,16 @@ class ApprovalWorkflow:
                 error="Failed to send approval request to Telegram",
             )
 
-        # Store the record
+        # Update Telegram message ID in database
+        try:
+            async with get_db_context() as db:
+                await approval_repository.set_telegram_message_id(
+                    db, approval_id, str(message_id)
+                )
+        except Exception as e:
+            log.warning("failed_to_update_telegram_message_id", error=str(e))
+
+        # Store the in-memory record
         record.telegram_message_id = message_id
         self._approvals[approval_code] = record
         self._approvals_by_id[record.id] = record
@@ -347,13 +408,51 @@ class ApprovalWorkflow:
 
         record = self._approvals_by_id.get(approval_id)
         if not record:
+            # Try to load from database
+            try:
+                async with get_db_context() as db:
+                    db_approval = await approval_repository.get_by_id(db, approval_id)
+                    if db_approval:
+                        record = ApprovalRecord(
+                            id=db_approval.id,
+                            reconciliation_id=db_approval.reconciliation_id,
+                            sleeve_id=uuid4(),  # Not stored in approval, use placeholder
+                            approval_code=db_approval.approval_code,
+                            proposed_trades=db_approval.proposed_trades,
+                            total_notional=sum(t.get("notional", 0) for t in db_approval.proposed_trades),
+                            status=ApprovalStatus(db_approval.status),
+                            expires_at=db_approval.expires_at,
+                        )
+                        self._approvals_by_id[approval_id] = record
+                        self._approvals[db_approval.approval_code] = record
+                        log.info("loaded_approval_from_database")
+            except Exception as e:
+                log.warning("failed_to_load_approval_from_db", error=str(e))
+
+        if not record:
             log.warning("approval_record_not_found")
             return
 
-        # Update record
+        responded_at = datetime.now(timezone.utc)
+
+        # Update in-memory record
         record.status = ApprovalStatus.APPROVED
-        record.responded_at = datetime.now(timezone.utc)
+        record.responded_at = responded_at
         record.approved_by = approved_by
+
+        # Update database record
+        try:
+            async with get_db_context() as db:
+                await approval_repository.update_status(
+                    db=db,
+                    approval_id=approval_id,
+                    status="approved",
+                    approved_by=approved_by,
+                    responded_at=responded_at,
+                )
+                log.info("approval_status_updated_in_database")
+        except Exception as e:
+            log.warning("failed_to_update_approval_in_db", error=str(e))
 
         log.info("approval_granted")
 
@@ -399,13 +498,50 @@ class ApprovalWorkflow:
 
         record = self._approvals_by_id.get(approval_id)
         if not record:
+            # Try to load from database
+            try:
+                async with get_db_context() as db:
+                    db_approval = await approval_repository.get_by_id(db, approval_id)
+                    if db_approval:
+                        record = ApprovalRecord(
+                            id=db_approval.id,
+                            reconciliation_id=db_approval.reconciliation_id,
+                            sleeve_id=uuid4(),
+                            approval_code=db_approval.approval_code,
+                            proposed_trades=db_approval.proposed_trades,
+                            total_notional=sum(t.get("notional", 0) for t in db_approval.proposed_trades),
+                            status=ApprovalStatus(db_approval.status),
+                            expires_at=db_approval.expires_at,
+                        )
+                        self._approvals_by_id[approval_id] = record
+                        self._approvals[db_approval.approval_code] = record
+            except Exception as e:
+                log.warning("failed_to_load_approval_from_db", error=str(e))
+
+        if not record:
             log.warning("approval_record_not_found")
             return
 
-        # Update record
+        responded_at = datetime.now(timezone.utc)
+
+        # Update in-memory record
         record.status = ApprovalStatus.REJECTED
-        record.responded_at = datetime.now(timezone.utc)
+        record.responded_at = responded_at
         record.approved_by = rejected_by  # Track who rejected
+
+        # Update database record
+        try:
+            async with get_db_context() as db:
+                await approval_repository.update_status(
+                    db=db,
+                    approval_id=approval_id,
+                    status="rejected",
+                    approved_by=rejected_by,
+                    responded_at=responded_at,
+                )
+                log.info("rejection_status_updated_in_database")
+        except Exception as e:
+            log.warning("failed_to_update_rejection_in_db", error=str(e))
 
         log.info("approval_rejected")
 
@@ -440,6 +576,7 @@ class ApprovalWorkflow:
         expired_count = 0
         now = datetime.now(timezone.utc)
 
+        # Expire in-memory approvals
         for code, record in list(self._approvals.items()):
             if record.status == ApprovalStatus.PENDING and record.is_expired():
                 record.status = ApprovalStatus.EXPIRED
@@ -459,22 +596,93 @@ class ApprovalWorkflow:
                     f"Expired at: {now.strftime('%Y-%m-%d %H:%M UTC')}",
                 )
 
+        # Expire database approvals
+        try:
+            async with get_db_context() as db:
+                db_expired = await approval_repository.get_expired(db)
+                for db_approval in db_expired:
+                    await approval_repository.mark_expired(db, db_approval.id)
+                    # Only count if not already counted from in-memory
+                    if db_approval.approval_code not in self._approvals:
+                        expired_count += 1
+                        logger.info(
+                            "db_approval_expired",
+                            approval_code=db_approval.approval_code,
+                            approval_id=str(db_approval.id),
+                        )
+        except Exception as e:
+            logger.warning("failed_to_expire_db_approvals", error=str(e))
+
         return expired_count
 
     def get_pending_approvals(self) -> list[ApprovalRecord]:
-        """Get all pending approval records."""
+        """Get all pending approval records from in-memory cache."""
         return [
             record
             for record in self._approvals.values()
             if record.status == ApprovalStatus.PENDING
         ]
 
+    async def get_pending_approvals_from_db(self) -> list[ApprovalRecord]:
+        """Get all pending approval records from database."""
+        records = []
+        try:
+            async with get_db_context() as db:
+                db_approvals = await approval_repository.get_pending(db)
+                for db_approval in db_approvals:
+                    record = ApprovalRecord(
+                        id=db_approval.id,
+                        reconciliation_id=db_approval.reconciliation_id,
+                        sleeve_id=uuid4(),
+                        approval_code=db_approval.approval_code,
+                        proposed_trades=db_approval.proposed_trades,
+                        total_notional=sum(t.get("notional", 0) for t in db_approval.proposed_trades),
+                        status=ApprovalStatus(db_approval.status),
+                        telegram_message_id=int(db_approval.telegram_message_id) if db_approval.telegram_message_id else None,
+                        requested_at=db_approval.requested_at,
+                        expires_at=db_approval.expires_at,
+                    )
+                    records.append(record)
+                    # Also cache in memory
+                    self._approvals[db_approval.approval_code] = record
+                    self._approvals_by_id[db_approval.id] = record
+        except Exception as e:
+            logger.warning("failed_to_get_pending_from_db", error=str(e))
+        return records
+
     def get_approval_by_code(self, code: str) -> ApprovalRecord | None:
-        """Get an approval record by its code."""
+        """Get an approval record by its code (in-memory only)."""
         return self._approvals.get(code)
 
+    async def get_approval_by_code_async(self, code: str) -> ApprovalRecord | None:
+        """Get an approval record by its code, falling back to database."""
+        record = self._approvals.get(code)
+        if record:
+            return record
+
+        try:
+            async with get_db_context() as db:
+                db_approval = await approval_repository.get_by_code(db, code)
+                if db_approval:
+                    record = ApprovalRecord(
+                        id=db_approval.id,
+                        reconciliation_id=db_approval.reconciliation_id,
+                        sleeve_id=uuid4(),
+                        approval_code=db_approval.approval_code,
+                        proposed_trades=db_approval.proposed_trades,
+                        total_notional=sum(t.get("notional", 0) for t in db_approval.proposed_trades),
+                        status=ApprovalStatus(db_approval.status),
+                        expires_at=db_approval.expires_at,
+                    )
+                    self._approvals[code] = record
+                    self._approvals_by_id[db_approval.id] = record
+                    return record
+        except Exception as e:
+            logger.warning("failed_to_get_approval_from_db", error=str(e))
+        return None
+
     def get_approval_by_id(self, approval_id: UUID) -> ApprovalRecord | None:
-        """Get an approval record by its ID."""
+        """Get an approval record by its ID (in-memory only)."""
         return self._approvals_by_id.get(approval_id)
 
 

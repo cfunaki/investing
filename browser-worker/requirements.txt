@@ -1,0 +1,17 @@
+# Browser Worker Service Dependencies
+# Minimal dependencies - only what's needed for the API wrapper
+
+# Web framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Request/response models
+pydantic>=2.5.0
+
+# Structured logging
+structlog>=24.1.0
+
+# Cloud Storage for session persistence
+google-cloud-storage>=2.14.0
+
+# Note: Playwright/Node.js dependencies are handled via npm in the Dockerfile

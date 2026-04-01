@@ -10,7 +10,6 @@ Processes new Bravos portfolio update emails:
 This integrates the existing Bravos reconciliation with the approval workflow.
 """
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -18,10 +17,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 
+from src.db.repositories.sleeve_repository import sleeve_repository
+from src.db.session import get_db_context
 from src.signals.bravos_detector import BravosEmailDetector, get_bravos_detector
 from src.signals.models import (
     ProposedTrade,
@@ -120,7 +121,7 @@ class BravosSignalProcessor:
 
             # Mark as processed if successful and not dry run
             if result.success and not dry_run and email:
-                self.detector.mark_as_processed(
+                await self.detector.mark_as_processed(
                     message_id=email.message_id,
                     subject=email.subject,
                     details={
@@ -264,7 +265,6 @@ class BravosSignalProcessor:
     ) -> bool:
         """Send approval request to Telegram."""
         from src.approval.workflow import get_approval_workflow
-        from uuid import uuid4
 
         log = logger.bind(
             message_id=email.message_id if email else None,
@@ -272,8 +272,21 @@ class BravosSignalProcessor:
         )
 
         try:
-            # Create a ReconciliationPlan for the approval workflow
-            sleeve_id = UUID(hashlib.md5(b"bravos").hexdigest())
+            # Get sleeve_id from database
+            sleeve_id = None
+            try:
+                async with get_db_context() as db:
+                    sleeve = await sleeve_repository.get_by_name(db, "bravos")
+                    if sleeve:
+                        sleeve_id = sleeve.id
+            except Exception as e:
+                log.warning("failed_to_get_sleeve_from_db", error=str(e))
+
+            if not sleeve_id:
+                # Fallback to generated UUID
+                sleeve_id = uuid4()
+                log.warning("using_generated_sleeve_id")
+
             intent_id = uuid4()
 
             plan = ReconciliationPlan.create(

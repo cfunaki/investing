@@ -110,6 +110,8 @@ class TelegramBot:
         app.add_handler(CommandHandler("dismiss", self._cmd_dismiss))
         app.add_handler(CommandHandler("buffett", self._cmd_buffett))
         app.add_handler(CommandHandler("bravos", self._cmd_bravos))
+        app.add_handler(CommandHandler("holdings", self._cmd_holdings))
+        app.add_handler(CommandHandler("portfolio", self._cmd_portfolio))
 
         # Callback query handler for inline buttons
         app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -484,8 +486,9 @@ class TelegramBot:
             "Use the buttons to approve or reject.\n\n"
             "Commands:\n"
             "/status - Show system status\n"
+            "/holdings - Show portfolio holdings\n"
             "/pending - List pending approvals\n"
-            "/help - Show this help message",
+            "/help - Show all commands",
             parse_mode="Markdown",
         )
 
@@ -509,6 +512,9 @@ class TelegramBot:
             "/review - Inspect an intent\n"
             "/retry - Re-process a signal\n"
             "/dismiss - Dismiss a review alert\n\n"
+            "*Portfolio:*\n"
+            "/holdings - Show current holdings\n"
+            "/portfolio - Detailed breakdown by sleeve\n\n"
             "*Other:*\n"
             "/help - Show this message",
             parse_mode="Markdown",
@@ -890,6 +896,270 @@ class TelegramBot:
         except Exception as e:
             logger.exception("bravos_check_failed", error=str(e))
             await update.message.reply_text(f"Error: {str(e)}")
+
+    # =========================================================================
+    # Holdings Command
+    # =========================================================================
+
+    async def _cmd_holdings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle /holdings command - show current Robinhood holdings.
+
+        Displays:
+        - Top positions by market value
+        - Total portfolio value
+        - Cash and buying power
+        - When data was last fetched
+        """
+        import json
+        from pathlib import Path
+
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            await update.message.reply_text("Unauthorized")
+            return
+
+        holdings_path = Path("data/processed/robinhood_holdings.json")
+
+        if not holdings_path.exists():
+            await update.message.reply_text(
+                "*Holdings Not Available*\n\n"
+                "No holdings data found. Run the holdings fetch first.",
+                parse_mode="Markdown",
+            )
+            return
+
+        try:
+            with open(holdings_path) as f:
+                data = json.load(f)
+
+            holdings = data.get("holdings", [])
+            account = data.get("account", {})
+            total_value = data.get("total_value", 0)
+            fetched_at = data.get("fetched_at", "Unknown")
+
+            # Parse fetched_at for display
+            if fetched_at and fetched_at != "Unknown":
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+                    fetched_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+                except Exception:
+                    fetched_str = fetched_at[:19]
+            else:
+                fetched_str = "Unknown"
+
+            # Sort holdings by market value descending
+            sorted_holdings = sorted(
+                [h for h in holdings if h.get("market_value", 0) > 0],
+                key=lambda h: h.get("market_value", 0),
+                reverse=True,
+            )
+
+            # Build message
+            lines = [
+                "*Robinhood Holdings*",
+                f"_Updated: {fetched_str}_",
+                "",
+            ]
+
+            # Account summary
+            portfolio_value = account.get("portfolio_value", total_value)
+            cash = account.get("cash", 0)
+            buying_power = account.get("buying_power", 0)
+
+            lines.extend([
+                f"Portfolio: `${portfolio_value:,.0f}`",
+                f"Holdings: `${total_value:,.0f}`",
+                f"Cash: `${cash:,.0f}`",
+                "",
+                "*Top Positions:*",
+            ])
+
+            # Show top 15 positions
+            for h in sorted_holdings[:15]:
+                symbol = h.get("symbol", "???")
+                market_value = h.get("market_value", 0)
+                pct = h.get("current_pct", 0) * 100
+                pl_pct = h.get("unrealized_pl_pct", 0)
+
+                # Emoji for gain/loss
+                emoji = "+" if pl_pct >= 0 else ""
+                lines.append(f"  {symbol}: `${market_value:,.0f}` ({pct:.1f}%) {emoji}{pl_pct:.1f}%")
+
+            if len(sorted_holdings) > 15:
+                lines.append(f"  _... and {len(sorted_holdings) - 15} more_")
+
+            lines.extend([
+                "",
+                f"Total positions: {len(sorted_holdings)}",
+            ])
+
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+        except Exception as e:
+            logger.exception("holdings_command_failed", error=str(e))
+            await update.message.reply_text(f"Error loading holdings: {str(e)}")
+
+    # =========================================================================
+    # Portfolio Command
+    # =========================================================================
+
+    async def _cmd_portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Handle /portfolio command - detailed portfolio breakdown by sleeve.
+
+        Displays:
+        - Sleeve attribution (Bravos, Buffett, Core)
+        - Value and P/L by sleeve
+        - Top gainers and losers
+        - Asset allocation summary
+        """
+        import json
+        from pathlib import Path
+
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            await update.message.reply_text("Unauthorized")
+            return
+
+        holdings_path = Path("data/processed/robinhood_holdings.json")
+        bravos_path = Path("data/processed/target_allocations.json")
+        buffett_path = Path("data/processed/buffett_allocations.json")
+
+        if not holdings_path.exists():
+            await update.message.reply_text(
+                "*Portfolio Not Available*\n\n"
+                "No holdings data found.",
+                parse_mode="Markdown",
+            )
+            return
+
+        try:
+            # Load holdings
+            with open(holdings_path) as f:
+                holdings_data = json.load(f)
+
+            holdings = holdings_data.get("holdings", [])
+            account = holdings_data.get("account", {})
+            total_holdings = holdings_data.get("total_value", 0)
+            fetched_at = holdings_data.get("fetched_at", "Unknown")
+
+            # Load sleeve targets to determine attribution
+            bravos_symbols = set()
+            buffett_symbols = set()
+
+            if bravos_path.exists():
+                with open(bravos_path) as f:
+                    bravos_data = json.load(f)
+                bravos_symbols = {a["symbol"] for a in bravos_data.get("allocations", [])}
+
+            if buffett_path.exists():
+                with open(buffett_path) as f:
+                    buffett_data = json.load(f)
+                buffett_symbols = {a["symbol"] for a in buffett_data.get("allocations", [])}
+
+            # Categorize holdings
+            bravos_holdings = []
+            buffett_holdings = []
+            core_holdings = []
+
+            # Common ETFs to categorize as "core"
+            etf_symbols = {"SPY", "QQQ", "IWM", "DIA", "VGT", "VWO", "VXUS", "VGK",
+                          "SLV", "GLD", "DBC", "XME", "CPER", "GREK", "ASEA", "YCS"}
+
+            for h in holdings:
+                symbol = h.get("symbol", "")
+                market_value = h.get("market_value", 0)
+                if market_value <= 0:
+                    continue
+
+                if symbol in bravos_symbols:
+                    bravos_holdings.append(h)
+                elif symbol in buffett_symbols:
+                    buffett_holdings.append(h)
+                else:
+                    core_holdings.append(h)
+
+            # Calculate sleeve totals
+            def sleeve_stats(holdings_list):
+                total_val = sum(h.get("market_value", 0) for h in holdings_list)
+                total_pl = sum(h.get("unrealized_pl", 0) for h in holdings_list)
+                return total_val, total_pl
+
+            bravos_val, bravos_pl = sleeve_stats(bravos_holdings)
+            buffett_val, buffett_pl = sleeve_stats(buffett_holdings)
+            core_val, core_pl = sleeve_stats(core_holdings)
+
+            # Parse fetched_at
+            if fetched_at and fetched_at != "Unknown":
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+                    fetched_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+                except Exception:
+                    fetched_str = fetched_at[:19]
+            else:
+                fetched_str = "Unknown"
+
+            # Calculate total P/L
+            total_pl = bravos_pl + buffett_pl + core_pl
+            cash = account.get("cash", 0)
+            portfolio_value = account.get("portfolio_value", total_holdings + cash)
+
+            # Build message
+            lines = [
+                "*Portfolio Overview*",
+                f"_Updated: {fetched_str}_",
+                "",
+                f"Total: `${portfolio_value:,.0f}`",
+                f"Invested: `${total_holdings:,.0f}`",
+                f"Cash: `${cash:,.0f}`",
+                "",
+                "*By Sleeve:*",
+            ]
+
+            # Sleeve breakdown
+            def format_sleeve(name, val, pl, count):
+                pl_emoji = "+" if pl >= 0 else ""
+                pct = (val / total_holdings * 100) if total_holdings > 0 else 0
+                return f"  {name}: `${val:,.0f}` ({pct:.0f}%) {pl_emoji}${pl:,.0f}"
+
+            lines.append(format_sleeve("Bravos", bravos_val, bravos_pl, len(bravos_holdings)))
+            lines.append(format_sleeve("Buffett", buffett_val, buffett_pl, len(buffett_holdings)))
+            lines.append(format_sleeve("Core/ETF", core_val, core_pl, len(core_holdings)))
+
+            # Top gainers
+            all_holdings = [h for h in holdings if h.get("market_value", 0) > 0]
+            sorted_by_pl = sorted(all_holdings, key=lambda h: h.get("unrealized_pl", 0), reverse=True)
+
+            lines.extend(["", "*Top Gainers:*"])
+            for h in sorted_by_pl[:3]:
+                symbol = h.get("symbol", "???")
+                pl = h.get("unrealized_pl", 0)
+                pl_pct = h.get("unrealized_pl_pct", 0)
+                lines.append(f"  {symbol}: +${pl:,.0f} (+{pl_pct:.1f}%)")
+
+            # Top losers
+            lines.extend(["", "*Top Losers:*"])
+            for h in sorted_by_pl[-3:]:
+                symbol = h.get("symbol", "???")
+                pl = h.get("unrealized_pl", 0)
+                pl_pct = h.get("unrealized_pl_pct", 0)
+                if pl < 0:
+                    lines.append(f"  {symbol}: ${pl:,.0f} ({pl_pct:.1f}%)")
+
+            # Position counts
+            lines.extend([
+                "",
+                f"Positions: {len(bravos_holdings)} Bravos, {len(buffett_holdings)} Buffett, {len(core_holdings)} Core",
+            ])
+
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+        except Exception as e:
+            logger.exception("portfolio_command_failed", error=str(e))
+            await update.message.reply_text(f"Error loading portfolio: {str(e)}")
 
     # =========================================================================
     # Lifecycle

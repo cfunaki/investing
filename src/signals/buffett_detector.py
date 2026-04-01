@@ -5,25 +5,27 @@ Detects new SEC 13F filings from Berkshire Hathaway and triggers
 the processing pipeline when a new filing is found.
 
 State tracking:
-- Stores last processed accession number in a JSON file
+- Stores processed accession numbers in the database signals table
 - Compares against latest filing from SEC EDGAR
 - Triggers processing only when new filing is detected
 """
 
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import structlog
 
+from src.db.repositories.signal_repository import signal_repository
+from src.db.repositories.sleeve_repository import sleeve_repository
+from src.db.session import get_db_context
 from src.signals.sec_edgar import SECEdgar13FFetcher, Filing13F
 
 logger = structlog.get_logger(__name__)
 
-# Default state file location
-STATE_FILE = Path("data/state/buffett_13f_state.json")
+# Buffett sleeve name
+BUFFETT_SLEEVE_NAME = "buffett"
 
 
 @dataclass
@@ -41,86 +43,105 @@ class Buffett13FDetector:
     """
     Detects new Berkshire Hathaway 13F filings.
 
-    Maintains state to know which filings have already been processed.
+    Maintains state in database to know which filings have already been processed.
     """
 
     def __init__(
         self,
-        state_file: Path = STATE_FILE,
         cik: str = "0001067983",  # Berkshire Hathaway
     ):
-        self.state_file = state_file
         self.cik = cik
         self.fetcher = SECEdgar13FFetcher()
+        self._sleeve_id: UUID | None = None
 
-        # Ensure state directory exists
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+    async def _get_sleeve_id(self) -> UUID | None:
+        """Get the Buffett sleeve ID from database."""
+        if self._sleeve_id:
+            return self._sleeve_id
 
-    def _load_state(self) -> dict[str, Any]:
-        """Load the current state from disk."""
-        if not self.state_file.exists():
-            return {
-                "last_processed_accession": None,
-                "last_checked_at": None,
-                "last_processed_at": None,
-                "processing_history": [],
-            }
+        try:
+            async with get_db_context() as db:
+                sleeve = await sleeve_repository.get_by_name(db, BUFFETT_SLEEVE_NAME)
+                if sleeve:
+                    self._sleeve_id = sleeve.id
+                    return self._sleeve_id
+        except Exception as e:
+            logger.warning("failed_to_get_sleeve_id", error=str(e))
 
-        with open(self.state_file) as f:
-            return json.load(f)
+        return None
 
-    def _save_state(self, state: dict[str, Any]):
-        """Save state to disk."""
-        with open(self.state_file, "w") as f:
-            json.dump(state, f, indent=2)
-
-    def get_last_processed_accession(self) -> str | None:
+    async def get_last_processed_accession(self) -> str | None:
         """Get the accession number of the last processed filing."""
-        state = self._load_state()
-        return state.get("last_processed_accession")
+        sleeve_id = await self._get_sleeve_id()
+        if not sleeve_id:
+            return None
 
-    def mark_as_processed(
+        try:
+            async with get_db_context() as db:
+                signal = await signal_repository.get_last_processed(db, sleeve_id)
+                if signal:
+                    return signal.source_event_id
+        except Exception as e:
+            logger.warning("failed_to_get_last_processed", error=str(e))
+
+        return None
+
+    async def mark_as_processed(
         self,
         accession_number: str,
         report_date: datetime | None = None,
         details: dict[str, Any] | None = None,
     ):
         """
-        Mark a filing as processed.
+        Mark a filing as processed by creating a signal record.
 
         Args:
             accession_number: The accession number of the processed filing
             report_date: The report period date
             details: Optional processing details to record
         """
-        state = self._load_state()
+        sleeve_id = await self._get_sleeve_id()
+        if not sleeve_id:
+            logger.error("cannot_mark_processed_no_sleeve_id")
+            return
 
-        now = datetime.now(timezone.utc).isoformat()
+        try:
+            async with get_db_context() as db:
+                # Check if already exists
+                existing = await signal_repository.get_by_source_event_id(
+                    db, sleeve_id, accession_number
+                )
+                if existing:
+                    # Update status to processed
+                    await signal_repository.update_status(
+                        db,
+                        existing.id,
+                        status="processed",
+                        processed_at=datetime.now(timezone.utc),
+                    )
+                else:
+                    # Create new signal record
+                    await signal_repository.create(
+                        db=db,
+                        sleeve_id=sleeve_id,
+                        source_event_id=accession_number,
+                        event_type="13f_filing",
+                        detected_at=datetime.now(timezone.utc),
+                        raw_payload={
+                            "report_date": report_date.isoformat() if report_date else None,
+                            "details": details,
+                        },
+                        status="processed",
+                    )
 
-        state["last_processed_accession"] = accession_number
-        state["last_processed_at"] = now
+                logger.info(
+                    "marked_filing_as_processed",
+                    accession_number=accession_number,
+                    report_date=str(report_date) if report_date else None,
+                )
 
-        # Add to history
-        history_entry = {
-            "accession_number": accession_number,
-            "report_date": report_date.isoformat() if report_date else None,
-            "processed_at": now,
-        }
-        if details:
-            history_entry["details"] = details
-
-        state.setdefault("processing_history", []).append(history_entry)
-
-        # Keep only last 10 entries
-        state["processing_history"] = state["processing_history"][-10:]
-
-        self._save_state(state)
-
-        logger.info(
-            "marked_filing_as_processed",
-            accession_number=accession_number,
-            report_date=str(report_date) if report_date else None,
-        )
+        except Exception as e:
+            logger.exception("failed_to_mark_as_processed", error=str(e))
 
     async def check_for_new_filing(self) -> FilingDetectionResult:
         """
@@ -131,11 +152,6 @@ class Buffett13FDetector:
         """
         log = logger.bind(cik=self.cik)
         log.info("checking_for_new_13f_filing")
-
-        # Update last checked timestamp
-        state = self._load_state()
-        state["last_checked_at"] = datetime.now(timezone.utc).isoformat()
-        self._save_state(state)
 
         try:
             # Fetch latest filing from SEC EDGAR
@@ -149,7 +165,7 @@ class Buffett13FDetector:
                 )
 
             current_accession = filing.accession_number
-            previous_accession = self.get_last_processed_accession()
+            previous_accession = await self.get_last_processed_accession()
 
             log = log.bind(
                 current_accession=current_accession,
@@ -192,16 +208,34 @@ class Buffett13FDetector:
                 error=str(e),
             )
 
-    def get_status(self) -> dict[str, Any]:
-        """Get the current detector status."""
-        state = self._load_state()
-        return {
-            "cik": self.cik,
-            "last_processed_accession": state.get("last_processed_accession"),
-            "last_checked_at": state.get("last_checked_at"),
-            "last_processed_at": state.get("last_processed_at"),
-            "history_count": len(state.get("processing_history", [])),
-        }
+    async def get_status(self) -> dict[str, Any]:
+        """Get the current detector status from database."""
+        sleeve_id = await self._get_sleeve_id()
+        if not sleeve_id:
+            return {
+                "cik": self.cik,
+                "error": "sleeve_not_found",
+                "last_processed_accession": None,
+            }
+
+        try:
+            async with get_db_context() as db:
+                # Get last processed signal
+                last_signal = await signal_repository.get_last_processed(db, sleeve_id)
+
+                # Get recent signals count
+                recent = await signal_repository.get_recent(db, sleeve_id, limit=10)
+
+                return {
+                    "cik": self.cik,
+                    "sleeve_id": str(sleeve_id),
+                    "last_processed_accession": last_signal.source_event_id if last_signal else None,
+                    "last_processed_at": last_signal.processed_at.isoformat() if last_signal and last_signal.processed_at else None,
+                    "history_count": len(recent),
+                }
+        except Exception as e:
+            logger.warning("failed_to_get_status", error=str(e))
+            return {"cik": self.cik, "error": str(e)}
 
 
 # Singleton instance

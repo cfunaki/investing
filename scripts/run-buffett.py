@@ -353,8 +353,8 @@ def cmd_execute(dry_run: bool = False, no_confirm: bool = False):
             result["symbol"] = symbol
             result["intended_value"] = amount
 
-            if result.get("state") == "queued" or result.get("status") == "dry_run":
-                print(f"      OK - Order {'simulated' if dry_run else 'queued'}")
+            if result.get("state") in ("queued", "unconfirmed", "confirmed", "filled") or result.get("status") == "dry_run":
+                print(f"      OK - Order {'simulated' if dry_run else result.get('state', 'placed')}")
                 results["sells"].append(result)
                 if not dry_run:
                     log_trade({"type": "sell", "sleeve": "buffett", **result})
@@ -391,8 +391,9 @@ def cmd_execute(dry_run: bool = False, no_confirm: bool = False):
             result["symbol"] = symbol
             result["intended_amount"] = amount
 
-            if result.get("state") == "queued" or result.get("status") == "dry_run":
-                print(f"      OK - Order {'simulated' if dry_run else 'queued'}")
+            if result.get("state") in ("queued", "unconfirmed", "confirmed", "filled") or result.get("status") == "dry_run":
+                state_msg = "simulated" if dry_run else result.get("state", "placed")
+                print(f"      OK - Order {state_msg}")
                 results["buys"].append(result)
                 if not dry_run:
                     log_trade({"type": "buy", "sleeve": "buffett", **result})

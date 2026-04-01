@@ -11,17 +11,18 @@ Processes new 13F filings:
 This integrates the Buffett adapter with the approval workflow.
 """
 
-import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 
 from src.adapters.buffett_13f import Buffett13FAdapter
+from src.db.repositories.sleeve_repository import sleeve_repository
+from src.db.session import get_db_context
 from src.signals.buffett_detector import Buffett13FDetector, get_buffett_detector
 from src.signals.models import (
     ProposedTrade,
@@ -124,7 +125,7 @@ class BuffettSignalProcessor:
 
             # Mark as processed if successful and not dry run
             if result.success and not dry_run:
-                self.detector.mark_as_processed(
+                await self.detector.mark_as_processed(
                     accession_number=filing.accession_number,
                     report_date=filing.report_date,
                     details={
@@ -312,8 +313,21 @@ class BuffettSignalProcessor:
         )
 
         try:
-            # Create a ReconciliationPlan for the approval workflow
-            sleeve_id = UUID(hashlib.md5(b"buffett").hexdigest())
+            # Get sleeve_id from database
+            sleeve_id = None
+            try:
+                async with get_db_context() as db:
+                    sleeve = await sleeve_repository.get_by_name(db, "buffett")
+                    if sleeve:
+                        sleeve_id = sleeve.id
+            except Exception as e:
+                log.warning("failed_to_get_sleeve_from_db", error=str(e))
+
+            if not sleeve_id:
+                # Fallback to generated UUID
+                sleeve_id = uuid4()
+                log.warning("using_generated_sleeve_id")
+
             intent_id = uuid4()
 
             plan = ReconciliationPlan.create(

@@ -5,25 +5,27 @@ Detects new portfolio update emails from Bravos Research and triggers
 the processing pipeline when a new email is found.
 
 State tracking:
-- Stores last processed email message ID in a JSON file
+- Stores processed email message IDs in the database signals table
 - Compares against latest emails from Gmail
 - Triggers processing only when new email is detected
 """
 
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import structlog
 
+from src.db.repositories.signal_repository import signal_repository
+from src.db.repositories.sleeve_repository import sleeve_repository
+from src.db.session import get_db_context
 from src.signals.email_monitor import GmailMonitor, get_email_monitor, EmailMessage
 
 logger = structlog.get_logger(__name__)
 
-# Default state file location
-STATE_FILE = Path("data/state/bravos_email_state.json")
+# Bravos sleeve name
+BRAVOS_SLEEVE_NAME = "bravos"
 
 
 @dataclass
@@ -41,19 +43,15 @@ class BravosEmailDetector:
     """
     Detects new Bravos portfolio update emails.
 
-    Maintains state to know which emails have already been processed.
+    Maintains state in database to know which emails have already been processed.
     """
 
     def __init__(
         self,
-        state_file: Path = STATE_FILE,
         monitor: GmailMonitor | None = None,
     ):
-        self.state_file = state_file
         self.monitor = monitor
-
-        # Ensure state directory exists
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self._sleeve_id: UUID | None = None
 
     def _get_monitor(self) -> GmailMonitor:
         """Get or create the Gmail monitor."""
@@ -61,82 +59,107 @@ class BravosEmailDetector:
             self.monitor = get_email_monitor()
         return self.monitor
 
-    def _load_state(self) -> dict[str, Any]:
-        """Load the current state from disk."""
-        if not self.state_file.exists():
-            return {
-                "last_processed_message_id": None,
-                "last_checked_at": None,
-                "last_processed_at": None,
-                "processing_history": [],
-            }
+    async def _get_sleeve_id(self) -> UUID | None:
+        """Get the Bravos sleeve ID from database."""
+        if self._sleeve_id:
+            return self._sleeve_id
 
-        with open(self.state_file) as f:
-            return json.load(f)
+        try:
+            async with get_db_context() as db:
+                sleeve = await sleeve_repository.get_by_name(db, BRAVOS_SLEEVE_NAME)
+                if sleeve:
+                    self._sleeve_id = sleeve.id
+                    return self._sleeve_id
+        except Exception as e:
+            logger.warning("failed_to_get_sleeve_id", error=str(e))
 
-    def _save_state(self, state: dict[str, Any]):
-        """Save state to disk."""
-        with open(self.state_file, "w") as f:
-            json.dump(state, f, indent=2)
+        return None
 
-    def get_last_processed_message_id(self) -> str | None:
+    async def get_last_processed_message_id(self) -> str | None:
         """Get the message ID of the last processed email."""
-        state = self._load_state()
-        return state.get("last_processed_message_id")
+        sleeve_id = await self._get_sleeve_id()
+        if not sleeve_id:
+            return None
 
-    def get_processed_message_ids(self) -> set[str]:
-        """Get all processed message IDs from history."""
-        state = self._load_state()
-        ids = set()
-        if state.get("last_processed_message_id"):
-            ids.add(state["last_processed_message_id"])
-        for entry in state.get("processing_history", []):
-            if entry.get("message_id"):
-                ids.add(entry["message_id"])
-        return ids
+        try:
+            async with get_db_context() as db:
+                signal = await signal_repository.get_last_processed(db, sleeve_id)
+                if signal:
+                    return signal.source_event_id
+        except Exception as e:
+            logger.warning("failed_to_get_last_processed", error=str(e))
 
-    def mark_as_processed(
+        return None
+
+    async def get_processed_message_ids(self) -> set[str]:
+        """Get all processed message IDs from database."""
+        sleeve_id = await self._get_sleeve_id()
+        if not sleeve_id:
+            return set()
+
+        try:
+            async with get_db_context() as db:
+                return await signal_repository.get_processed_event_ids(db, sleeve_id)
+        except Exception as e:
+            logger.warning("failed_to_get_processed_ids", error=str(e))
+            return set()
+
+    async def mark_as_processed(
         self,
         message_id: str,
         subject: str | None = None,
         details: dict[str, Any] | None = None,
     ):
         """
-        Mark an email as processed.
+        Mark an email as processed by creating a signal record.
 
         Args:
             message_id: The Gmail message ID of the processed email
             subject: The email subject
             details: Optional processing details to record
         """
-        state = self._load_state()
+        sleeve_id = await self._get_sleeve_id()
+        if not sleeve_id:
+            logger.error("cannot_mark_processed_no_sleeve_id")
+            return
 
-        now = datetime.now(timezone.utc).isoformat()
+        try:
+            async with get_db_context() as db:
+                # Check if already exists
+                existing = await signal_repository.get_by_source_event_id(
+                    db, sleeve_id, message_id
+                )
+                if existing:
+                    # Update status to processed
+                    await signal_repository.update_status(
+                        db,
+                        existing.id,
+                        status="processed",
+                        processed_at=datetime.now(timezone.utc),
+                    )
+                else:
+                    # Create new signal record
+                    await signal_repository.create(
+                        db=db,
+                        sleeve_id=sleeve_id,
+                        source_event_id=message_id,
+                        event_type="email_detected",
+                        detected_at=datetime.now(timezone.utc),
+                        raw_payload={
+                            "subject": subject,
+                            "details": details,
+                        },
+                        status="processed",
+                    )
 
-        state["last_processed_message_id"] = message_id
-        state["last_processed_at"] = now
+                logger.info(
+                    "marked_email_as_processed",
+                    message_id=message_id,
+                    subject=subject,
+                )
 
-        # Add to history
-        history_entry = {
-            "message_id": message_id,
-            "subject": subject,
-            "processed_at": now,
-        }
-        if details:
-            history_entry["details"] = details
-
-        state.setdefault("processing_history", []).append(history_entry)
-
-        # Keep only last 20 entries
-        state["processing_history"] = state["processing_history"][-20:]
-
-        self._save_state(state)
-
-        logger.info(
-            "marked_email_as_processed",
-            message_id=message_id,
-            subject=subject,
-        )
+        except Exception as e:
+            logger.exception("failed_to_mark_as_processed", error=str(e))
 
     async def check_for_new_email(self) -> EmailDetectionResult:
         """
@@ -148,14 +171,9 @@ class BravosEmailDetector:
         log = logger.bind()
         log.info("checking_for_new_bravos_email")
 
-        # Update last checked timestamp
-        state = self._load_state()
-        state["last_checked_at"] = datetime.now(timezone.utc).isoformat()
-        self._save_state(state)
-
         try:
-            # Get processed message IDs to skip
-            processed_ids = self.get_processed_message_ids()
+            # Get processed message IDs from database
+            processed_ids = await self.get_processed_message_ids()
 
             # Check for new emails
             monitor = self._get_monitor()
@@ -164,7 +182,7 @@ class BravosEmailDetector:
                 processed_ids=processed_ids,
             )
 
-            previous_message_id = self.get_last_processed_message_id()
+            previous_message_id = await self.get_last_processed_message_id()
 
             if not emails:
                 log.info("no_new_bravos_emails")
@@ -198,15 +216,32 @@ class BravosEmailDetector:
                 error=str(e),
             )
 
-    def get_status(self) -> dict[str, Any]:
-        """Get the current detector status."""
-        state = self._load_state()
-        return {
-            "last_processed_message_id": state.get("last_processed_message_id"),
-            "last_checked_at": state.get("last_checked_at"),
-            "last_processed_at": state.get("last_processed_at"),
-            "history_count": len(state.get("processing_history", [])),
-        }
+    async def get_status(self) -> dict[str, Any]:
+        """Get the current detector status from database."""
+        sleeve_id = await self._get_sleeve_id()
+        if not sleeve_id:
+            return {
+                "error": "sleeve_not_found",
+                "last_processed_message_id": None,
+            }
+
+        try:
+            async with get_db_context() as db:
+                # Get last processed signal
+                last_signal = await signal_repository.get_last_processed(db, sleeve_id)
+
+                # Get recent signals count
+                recent = await signal_repository.get_recent(db, sleeve_id, limit=20)
+
+                return {
+                    "sleeve_id": str(sleeve_id),
+                    "last_processed_message_id": last_signal.source_event_id if last_signal else None,
+                    "last_processed_at": last_signal.processed_at.isoformat() if last_signal and last_signal.processed_at else None,
+                    "history_count": len(recent),
+                }
+        except Exception as e:
+            logger.warning("failed_to_get_status", error=str(e))
+            return {"error": str(e)}
 
 
 # Singleton instance

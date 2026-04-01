@@ -1,0 +1,159 @@
+# Cloud Build configuration for deploying to Cloud Run
+#
+# This file defines the CI/CD pipeline for both services:
+# 1. orchestrator - Main API service
+# 2. browser-worker - Playwright scraping service
+#
+# Usage:
+#   gcloud builds submit --config cloudbuild.yaml
+#
+# Prerequisites:
+#   - Cloud Build API enabled
+#   - Cloud Run API enabled
+#   - Artifact Registry repository created
+#   - Service account with Cloud Run Admin and Secret Manager access
+
+substitutions:
+  _REGION: us-central1
+  _PROJECT_NUMBER: '770951850070'  # Override with --substitutions=_PROJECT_NUMBER=xxx if different
+  _ARTIFACT_REGISTRY: us-central1-docker.pkg.dev/investing-automation-490206/investing
+  _ORCHESTRATOR_SERVICE: investing-orchestrator
+  _BROWSER_WORKER_SERVICE: investing-browser-worker
+  _TAG: latest
+
+steps:
+  # ==========================================================================
+  # Build Orchestrator Service
+  # ==========================================================================
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-orchestrator'
+    args:
+      - 'build'
+      - '-t'
+      - '${_ARTIFACT_REGISTRY}/${_ORCHESTRATOR_SERVICE}:$_TAG'
+      - '-t'
+      - '${_ARTIFACT_REGISTRY}/${_ORCHESTRATOR_SERVICE}:latest'
+      - '-f'
+      - 'Dockerfile'
+      - '.'
+
+  # ==========================================================================
+  # Build Browser Worker Service
+  # ==========================================================================
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-browser-worker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_ARTIFACT_REGISTRY}/${_BROWSER_WORKER_SERVICE}:$_TAG'
+      - '-t'
+      - '${_ARTIFACT_REGISTRY}/${_BROWSER_WORKER_SERVICE}:latest'
+      - '-f'
+      - 'browser-worker/Dockerfile'
+      - '.'
+
+  # ==========================================================================
+  # Push Images to Artifact Registry
+  # ==========================================================================
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-orchestrator'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_ARTIFACT_REGISTRY}/${_ORCHESTRATOR_SERVICE}'
+    waitFor:
+      - 'build-orchestrator'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-browser-worker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_ARTIFACT_REGISTRY}/${_BROWSER_WORKER_SERVICE}'
+    waitFor:
+      - 'build-browser-worker'
+
+  # ==========================================================================
+  # Deploy Browser Worker Service (deploy first - orchestrator depends on it)
+  # ==========================================================================
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-browser-worker'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_BROWSER_WORKER_SERVICE}'
+      - '--image'
+      - '${_ARTIFACT_REGISTRY}/${_BROWSER_WORKER_SERVICE}:$_TAG'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'  # Change to --no-allow-unauthenticated + IAM for security
+      - '--memory'
+      - '1Gi'
+      - '--cpu'
+      - '1'
+      - '--timeout'
+      - '300'  # 5 minutes for long scrapes
+      - '--concurrency'
+      - '1'  # One request at a time (browser is single-threaded)
+      - '--min-instances'
+      - '0'  # Start with cold starts accepted
+      - '--max-instances'
+      - '2'
+      - '--set-secrets'
+      - 'BRAVOS_USERNAME=BRAVOS_USERNAME:latest,BRAVOS_PASSWORD=BRAVOS_PASSWORD:latest'
+      - '--set-env-vars'
+      - 'GCS_SESSION_BUCKET=investing-automation-sessions'
+    waitFor:
+      - 'push-browser-worker'
+
+  # ==========================================================================
+  # Deploy Orchestrator Service
+  # ==========================================================================
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-orchestrator'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_ORCHESTRATOR_SERVICE}'
+      - '--image'
+      - '${_ARTIFACT_REGISTRY}/${_ORCHESTRATOR_SERVICE}:$_TAG'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'  # For health checks; secure endpoints via app logic
+      - '--memory'
+      - '512Mi'
+      - '--cpu'
+      - '1'
+      - '--timeout'
+      - '60'
+      - '--concurrency'
+      - '80'
+      - '--min-instances'
+      - '0'
+      - '--max-instances'
+      - '3'
+      - '--set-secrets'
+      - 'DATABASE_URL=DATABASE_URL:latest,RH_USERNAME=RH_USERNAME:latest,RH_PASSWORD=RH_PASSWORD:latest,TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,TELEGRAM_CHAT_ID=TELEGRAM_CHAT_ID:latest,TELEGRAM_ALLOWED_USERS=TELEGRAM_ALLOWED_USERS:latest'
+      - '--set-env-vars'
+      - 'ENVIRONMENT=production,DRY_RUN=true,BROWSER_WORKER_URL=https://${_BROWSER_WORKER_SERVICE}-${_PROJECT_NUMBER}.${_REGION}.run.app'
+    waitFor:
+      - 'push-orchestrator'
+      - 'deploy-browser-worker'
+
+# Images to be pushed
+images:
+  - '${_ARTIFACT_REGISTRY}/${_ORCHESTRATOR_SERVICE}:$_TAG'
+  - '${_ARTIFACT_REGISTRY}/${_ORCHESTRATOR_SERVICE}:latest'
+  - '${_ARTIFACT_REGISTRY}/${_BROWSER_WORKER_SERVICE}:$_TAG'
+  - '${_ARTIFACT_REGISTRY}/${_BROWSER_WORKER_SERVICE}:latest'
+
+# Build options
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'  # Faster builds
