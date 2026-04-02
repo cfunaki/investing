@@ -50,6 +50,20 @@ class ApprovalRepository:
         result = await db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_sleeve_id_for_approval(
+        self, db: AsyncSession, approval_id: UUID
+    ) -> UUID | None:
+        """Get the sleeve_id for an approval by looking up the reconciliation."""
+        from src.db.models import Reconciliation
+
+        stmt = (
+            select(Reconciliation.sleeve_id)
+            .join(Approval, Approval.reconciliation_id == Reconciliation.id)
+            .where(Approval.id == approval_id)
+        )
+        result = await db.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def get_pending(self, db: AsyncSession) -> list[Approval]:
         """Get all pending approvals."""
         stmt = (

@@ -48,6 +48,7 @@ class DeltaTrade:
     side: str  # 'buy' or 'sell'
     notional: Decimal  # Dollar amount to trade
     weight_delta: Decimal  # Weight units changed
+    target_weight: Decimal  # Final weight after this trade
     rationale: str
 
 
@@ -212,6 +213,7 @@ class DeltaReconciler:
                         side="buy",
                         notional=notional,
                         weight_delta=change.new_weight,
+                        target_weight=change.new_weight,
                         rationale=f"New position: weight {change.new_weight}",
                     )
                 )
@@ -222,6 +224,7 @@ class DeltaReconciler:
                         side="sell",
                         notional=notional,  # This will be overridden to sell all
                         weight_delta=-change.old_weight,
+                        target_weight=Decimal(0),
                         rationale=f"Exit position: was weight {change.old_weight}",
                     )
                 )
@@ -232,6 +235,7 @@ class DeltaReconciler:
                         side="buy",
                         notional=notional,
                         weight_delta=change.weight_delta,
+                        target_weight=change.new_weight,
                         rationale=f"Increase weight: {change.old_weight} → {change.new_weight}",
                     )
                 )
@@ -242,6 +246,7 @@ class DeltaReconciler:
                         side="sell",
                         notional=notional,
                         weight_delta=change.weight_delta,
+                        target_weight=change.new_weight,
                         rationale=f"Decrease weight: {change.old_weight} → {change.new_weight}",
                     )
                 )
