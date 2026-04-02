@@ -58,7 +58,8 @@ async def lifespan(app: FastAPI):
     try:
         bot = get_telegram_bot()
         await bot.application.initialize()
-        logger.info("Telegram bot initialized for webhook mode")
+        await bot.application.start()
+        logger.info("Telegram bot started for webhook mode")
     except Exception as e:
         logger.error(f"Failed to initialize Telegram bot: {e}")
 
@@ -89,6 +90,7 @@ async def lifespan(app: FastAPI):
     # Shutdown Telegram bot
     try:
         bot = get_telegram_bot()
+        await bot.application.stop()
         await bot.application.shutdown()
         logger.info("Telegram bot shut down")
     except Exception as e:
