@@ -47,6 +47,9 @@ BRAVOS_TRADES_PATH = Path("data/processed/bravos_trades.json")
 RECONCILIATION_PATH = Path("data/processed/reconciliation.json")
 PROPOSED_ORDERS_PATH = Path("data/processed/proposed_orders.json")
 
+# Symbols not available on Robinhood - skip these in reconciliation
+SKIP_SYMBOLS = {"ALUM"}
+
 
 @dataclass
 class BravosProcessingResult:
@@ -215,7 +218,14 @@ class BravosSignalProcessor:
             bravos_data = json.load(f)
 
         new_weights = parse_bravos_weights(bravos_data)
-        log.info("bravos_weights_parsed", symbol_count=len(new_weights))
+
+        # Filter out symbols not available on Robinhood
+        skipped = [s for s in new_weights if s in SKIP_SYMBOLS]
+        if skipped:
+            log.info("skipping_non_tradeable_symbols", symbols=skipped)
+            new_weights = {k: v for k, v in new_weights.items() if k not in SKIP_SYMBOLS}
+
+        log.info("bravos_weights_parsed", symbol_count=len(new_weights), skipped=skipped)
 
         # Step 3: Get sleeve info
         sleeve_id = None
