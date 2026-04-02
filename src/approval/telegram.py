@@ -1180,6 +1180,58 @@ class TelegramBot:
             await self._application.stop()
             await self._application.shutdown()
 
+    async def setup_webhook(self, webhook_url: str) -> bool:
+        """
+        Set up Telegram webhook for receiving updates.
+
+        Args:
+            webhook_url: Public HTTPS URL for the webhook endpoint
+                        (e.g., https://your-service.run.app/webhooks/telegram)
+
+        Returns:
+            True if webhook was set successfully
+        """
+        log = logger.bind(webhook_url=webhook_url)
+
+        try:
+            bot = self.application.bot
+
+            # Delete any existing webhook first
+            await bot.delete_webhook(drop_pending_updates=True)
+
+            # Set the new webhook
+            result = await bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=["message", "callback_query"],
+            )
+
+            if result:
+                log.info("telegram_webhook_set")
+                return True
+            else:
+                log.error("telegram_webhook_failed")
+                return False
+
+        except Exception as e:
+            log.exception("telegram_webhook_setup_error", error=str(e))
+            return False
+
+    async def get_webhook_info(self) -> dict:
+        """Get current webhook configuration."""
+        try:
+            bot = self.application.bot
+            info = await bot.get_webhook_info()
+            return {
+                "url": info.url,
+                "has_custom_certificate": info.has_custom_certificate,
+                "pending_update_count": info.pending_update_count,
+                "last_error_date": info.last_error_date,
+                "last_error_message": info.last_error_message,
+            }
+        except Exception as e:
+            logger.exception("get_webhook_info_failed", error=str(e))
+            return {"error": str(e)}
+
 
 # Singleton instance
 _bot: TelegramBot | None = None

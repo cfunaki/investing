@@ -77,6 +77,10 @@ class Settings(BaseSettings):
         default=None,
         description="Default chat ID for sending notifications",
     )
+    telegram_webhook_url: Optional[str] = Field(
+        default=None,
+        description="Public URL for Telegram webhook (e.g., https://your-service.run.app/webhooks/telegram)",
+    )
 
     @field_validator("telegram_allowed_users", mode="before")
     @classmethod

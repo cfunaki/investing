@@ -60,6 +60,16 @@ async def lifespan(app: FastAPI):
         await bot.application.initialize()
         await bot.application.start()
         logger.info("Telegram bot started for webhook mode")
+
+        # Set up webhook if URL is configured
+        if config.telegram_webhook_url:
+            webhook_result = await bot.setup_webhook(config.telegram_webhook_url)
+            if webhook_result:
+                logger.info(f"Telegram webhook configured: {config.telegram_webhook_url}")
+            else:
+                logger.error("Failed to set Telegram webhook")
+        else:
+            logger.info("No webhook URL configured, callbacks require polling mode")
     except Exception as e:
         logger.error(f"Failed to initialize Telegram bot: {e}")
 
@@ -784,4 +794,98 @@ async def debug_config(config: Settings = Depends(get_config)):
         "approval_expiry_minutes": config.approval_expiry_minutes,
         "email_poll_interval_seconds": config.email_poll_interval_seconds,
         "browser_worker_url": config.browser_worker_url,
+        "telegram_webhook_url": config.telegram_webhook_url,
     }
+
+
+@app.get("/debug/webhook", tags=["Debug"])
+async def debug_webhook():
+    """Get current Telegram webhook configuration."""
+    bot = get_telegram_bot()
+    info = await bot.get_webhook_info()
+    return info
+
+
+@app.post("/debug/webhook", tags=["Debug"])
+async def set_webhook(webhook_url: str):
+    """Manually set the Telegram webhook URL."""
+    bot = get_telegram_bot()
+    result = await bot.setup_webhook(webhook_url)
+    if result:
+        return {"success": True, "webhook_url": webhook_url}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to set webhook")
+
+
+# =============================================================================
+# Bravos Scheduler Endpoint
+# =============================================================================
+
+
+@app.post("/jobs/poll-bravos", response_model=JobResponse, tags=["Jobs"])
+async def job_poll_bravos(force: bool = False, skip_scrape: bool = False):
+    """
+    Scheduled job: Check for new Bravos emails and process.
+
+    Called by Cloud Scheduler every 3 hours.
+
+    Args:
+        force: Force processing even if email was already seen
+        skip_scrape: Skip scraping (use cached data)
+    """
+    started_at = datetime.now(timezone.utc)
+    log = structlog.get_logger(__name__).bind(job="poll_bravos", force=force)
+
+    try:
+        log.info("starting_bravos_poll")
+
+        from src.signals.bravos_processor import get_bravos_processor
+
+        processor = get_bravos_processor()
+        result = await processor.check_and_process(
+            force=force,
+            dry_run=False,
+            skip_scrape=skip_scrape,
+        )
+
+        if not result.success:
+            log.error("bravos_poll_failed", error=result.error)
+            return JobResponse(
+                job="poll_bravos",
+                status="failed",
+                started_at=started_at.isoformat(),
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                error=result.error,
+            )
+
+        log.info(
+            "bravos_poll_completed",
+            new_email=result.new_email,
+            trade_count=result.trade_count,
+        )
+
+        return JobResponse(
+            job="poll_bravos",
+            status="completed",
+            started_at=started_at.isoformat(),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            results={
+                "new_email": result.new_email,
+                "message_id": result.message_id,
+                "subject": result.subject,
+                "trade_count": result.trade_count,
+                "total_buy": result.total_buy,
+                "total_sell": result.total_sell,
+                "approval_sent": result.approval_sent,
+            },
+        )
+
+    except Exception as e:
+        log.exception("bravos_poll_failed", error=str(e))
+        return JobResponse(
+            job="poll_bravos",
+            status="failed",
+            started_at=started_at.isoformat(),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            error=str(e),
+        )
