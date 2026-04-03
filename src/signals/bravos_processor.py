@@ -13,6 +13,7 @@ Don't touch other positions in the sleeve.
 """
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import structlog
 
 from src.db.repositories.sleeve_repository import sleeve_repository
@@ -156,6 +158,76 @@ class BravosSignalProcessor:
                 error=str(e),
             )
 
+    async def _scrape_bravos(self, log) -> dict:
+        """
+        Scrape Bravos active trades using browser worker or local fallback.
+
+        Returns:
+            dict with 'success' key and 'error' if failed
+        """
+        from src.config import get_settings
+
+        settings = get_settings()
+        browser_worker_url = settings.browser_worker_url
+
+        # Try browser worker first (for Cloud Run)
+        if browser_worker_url and not browser_worker_url.startswith("http://localhost"):
+            log.info("scraping_via_browser_worker", url=browser_worker_url)
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(
+                        f"{browser_worker_url}/scrape/bravos",
+                        json={},
+                    )
+
+                    if response.status_code == 200:
+                        data = response.json()
+                        # Save the scraped data
+                        BRAVOS_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                        with open(BRAVOS_TRADES_PATH, "w") as f:
+                            json.dump(data, f, indent=2)
+                        return {"success": True}
+                    else:
+                        log.error(
+                            "browser_worker_scrape_failed",
+                            status=response.status_code,
+                            body=response.text[:200],
+                        )
+                        return {
+                            "success": False,
+                            "error": f"Browser worker returned {response.status_code}",
+                        }
+
+            except httpx.TimeoutException:
+                log.error("browser_worker_timeout")
+                return {"success": False, "error": "Browser worker timeout"}
+            except Exception as e:
+                log.error("browser_worker_error", error=str(e))
+                # Fall through to local fallback
+
+        # Local fallback (for development)
+        log.info("scraping_via_local_subprocess")
+        try:
+            result = subprocess.run(
+                ["npx", "tsx", "scripts/scrape-active-trades.ts"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": f"Local scrape failed: {result.stderr[:200] if result.stderr else 'Unknown'}",
+                }
+
+            return {"success": True}
+
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Local scrape timed out"}
+        except FileNotFoundError:
+            return {"success": False, "error": "npx not found - use browser worker in production"}
+
     async def _process_reconciliation(
         self,
         email,
@@ -176,35 +248,23 @@ class BravosSignalProcessor:
         if not skip_scrape:
             log.info("running_bravos_scrape")
             try:
-                result = subprocess.run(
-                    ["npx", "tsx", "scripts/scrape-active-trades.ts"],
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                )
-
-                if result.returncode != 0:
-                    log.error(
-                        "bravos_scrape_failed",
-                        returncode=result.returncode,
-                        stderr=result.stderr[:500] if result.stderr else None,
-                    )
+                scrape_result = await self._scrape_bravos(log)
+                if not scrape_result["success"]:
                     return BravosProcessingResult(
                         success=False,
                         new_email=True if email else False,
                         message_id=email.message_id if email else None,
-                        error=f"Bravos scrape failed: {result.stderr[:200] if result.stderr else 'Unknown error'}",
+                        error=scrape_result.get("error", "Bravos scrape failed"),
                     )
-
                 log.info("bravos_scrape_completed")
 
-            except subprocess.TimeoutExpired:
-                log.error("bravos_scrape_timeout")
+            except Exception as e:
+                log.error("bravos_scrape_error", error=str(e))
                 return BravosProcessingResult(
                     success=False,
                     new_email=True if email else False,
                     message_id=email.message_id if email else None,
-                    error="Bravos scrape timed out",
+                    error=f"Bravos scrape error: {str(e)}",
                 )
 
         # Step 2: Load current Bravos weights
