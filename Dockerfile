@@ -34,6 +34,10 @@ ENV PATH=/home/appuser/.local/bin:$PATH
 # Copy application code
 COPY src/ ./src/
 
+# Create data directories with proper permissions
+RUN mkdir -p /app/data/processed /app/data/state /app/data/sessions && \
+    chown -R appuser:appuser /app/data
+
 # Set Python path
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
