@@ -233,27 +233,6 @@ class RobinhoodAdapter(BrokerAdapter):
         try:
             builtins.input = patched_input
 
-            # Monkey-patch request_post to log the login API response.
-            # authentication.py uses `from helper import *` so we must patch
-            # BOTH the helper module AND the authentication module's local ref.
-            import robin_stocks.robinhood.helper as rh_helper
-            import robin_stocks.robinhood.authentication as rh_auth
-            original_request_post = rh_helper.request_post
-
-            def logged_request_post(url, payload=None, timeout=16, json=False, jsonify_data=True):
-                resp = original_request_post(url, payload, timeout, json, jsonify_data)
-                # Log all POST responses (not just oauth2) to see full flow
-                safe_keys = list(resp.keys()) if isinstance(resp, dict) else str(type(resp))
-                log.info("rh_request_post_response", url=str(url), keys=safe_keys)
-                if isinstance(resp, dict) and 'detail' in resp:
-                    log.info("rh_response_detail", url=str(url), detail=resp['detail'])
-                if isinstance(resp, dict) and 'verification_workflow' in resp:
-                    log.info("rh_verification_workflow", workflow=resp['verification_workflow'])
-                return resp
-
-            rh_helper.request_post = logged_request_post
-            rh_auth.request_post = logged_request_post
-
             # Run rh.login() in a thread (it's synchronous)
             result = await _run_sync(
                 rh.login,
@@ -261,9 +240,6 @@ class RobinhoodAdapter(BrokerAdapter):
                 password=self._password,
                 store_session=True,
             )
-
-            rh_helper.request_post = original_request_post
-            rh_auth.request_post = original_request_post
 
             if result:
                 self._connected = True
