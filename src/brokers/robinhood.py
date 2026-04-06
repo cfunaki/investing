@@ -245,6 +245,8 @@ class RobinhoodAdapter(BrokerAdapter):
                 # Log all POST responses (not just oauth2) to see full flow
                 safe_keys = list(resp.keys()) if isinstance(resp, dict) else str(type(resp))
                 log.info("rh_request_post_response", url=str(url), keys=safe_keys)
+                if isinstance(resp, dict) and 'detail' in resp:
+                    log.info("rh_response_detail", url=str(url), detail=resp['detail'])
                 if isinstance(resp, dict) and 'verification_workflow' in resp:
                     log.info("rh_verification_workflow", workflow=resp['verification_workflow'])
                 return resp
