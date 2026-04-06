@@ -268,6 +268,16 @@ VALUES (
     '{"poll_interval_minutes": 5, "email_from": "bravos"}'::jsonb
 );
 
+-- Insert Buffett sleeve (unit-based allocation: $240 per weight unit based on 13F weights)
+INSERT INTO sleeves (name, adapter_type, allocation_mode, unit_size, config)
+VALUES (
+    'buffett',
+    'sec_13f',
+    'unit_based',
+    240.00,
+    '{"cik": "0001067983", "top_n_positions": 10, "min_portfolio_weight_pct": 3.0}'::jsonb
+);
+
 -- ============================================================================
 -- ROW LEVEL SECURITY (Optional - enable if using Supabase Auth)
 -- ============================================================================

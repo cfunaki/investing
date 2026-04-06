@@ -4,9 +4,9 @@ Buffett sleeve signal processor.
 Processes new 13F filings:
 1. Detects new filing via SEC EDGAR
 2. Parses holdings and calculates target allocations
-3. Reconciles against current Robinhood holdings
+3. Reconciles against sleeve_positions ledger using DeltaReconciler
 4. Sends proposed trades to Telegram for approval
-5. Executes trades on approval
+5. Executes trades on approval (ledger updated after execution)
 
 This integrates the Buffett adapter with the approval workflow.
 """
@@ -23,6 +23,10 @@ import structlog
 from src.adapters.buffett_13f import Buffett13FAdapter
 from src.db.repositories.sleeve_repository import sleeve_repository
 from src.db.session import get_db_context
+from src.reconciliation.delta_reconciler import (
+    get_delta_reconciler,
+    parse_buffett_weights,
+)
 from src.signals.buffett_detector import Buffett13FDetector, get_buffett_detector
 from src.signals.models import (
     ProposedTrade,
@@ -32,8 +36,7 @@ from src.signals.models import (
 
 logger = structlog.get_logger(__name__)
 
-# Paths
-HOLDINGS_PATH = Path("data/processed/robinhood_holdings.json")
+# Paths (RECONCILIATION_PATH kept for audit trail/debugging)
 RECONCILIATION_PATH = Path("data/processed/buffett_reconciliation.json")
 
 
@@ -151,7 +154,7 @@ class BuffettSignalProcessor:
         filing,
         dry_run: bool,
     ) -> BuffettProcessingResult:
-        """Process a 13F filing and calculate trades."""
+        """Process a 13F filing and calculate trades using virtual ledger."""
         log = logger.bind(accession_number=filing.accession_number)
 
         # Fetch portfolio via adapter (uses the filing we just got)
@@ -171,81 +174,70 @@ class BuffettSignalProcessor:
             allocations=len(portfolio.allocations),
         )
 
-        # Load current holdings
-        if not HOLDINGS_PATH.exists():
+        # Get sleeve from database
+        sleeve_id = None
+        try:
+            async with get_db_context() as db:
+                sleeve = await sleeve_repository.get_by_name(db, "buffett")
+                if sleeve:
+                    sleeve_id = sleeve.id
+        except Exception as e:
+            log.warning("failed_to_get_sleeve_from_db", error=str(e))
+
+        if not sleeve_id:
             return BuffettProcessingResult(
                 success=False,
                 new_filing=True,
                 accession_number=filing.accession_number,
-                error="No Robinhood holdings found. Run 'make holdings' first.",
+                error="Buffett sleeve not configured in database. Run schema migration.",
             )
 
-        with open(HOLDINGS_PATH) as f:
-            holdings_data = json.load(f)
+        # Parse allocations to weights
+        new_weights = parse_buffett_weights(portfolio.allocations)
+        log.info("parsed_weights", weights=dict(new_weights))
 
-        # Build holdings lookup
-        current_holdings = {}
-        for h in holdings_data.get("holdings", []):
-            symbol = h.get("symbol")
-            if symbol:
-                current_holdings[symbol] = {
-                    "quantity": float(h.get("quantity", 0)),
-                    "market_value": float(h.get("market_value", 0)),
-                    "price": float(h.get("current_price", 0)),
-                }
+        # Run delta reconciliation (reads current positions from sleeve_positions table)
+        reconciler = get_delta_reconciler()
+        delta_result = await reconciler.reconcile(
+            sleeve_id=sleeve_id,
+            new_weights=new_weights,
+        )
 
-        # Calculate reconciliation
-        dollars_per_weight = self.adapter.config.get("dollars_per_weight", 500)
-        deltas = []
+        if not delta_result.success:
+            return BuffettProcessingResult(
+                success=False,
+                new_filing=True,
+                accession_number=filing.accession_number,
+                error=delta_result.error or "Delta reconciliation failed",
+            )
+
+        # Convert DeltaTrade objects to ProposedTrade with weight metadata
         proposed_trades = []
+        deltas = []  # For audit trail
 
-        for alloc in portfolio.allocations:
-            target_value = (alloc.raw_weight or 0) * dollars_per_weight
-            current = current_holdings.get(alloc.symbol, {})
-            current_value = current.get("market_value", 0)
-            current_price = current.get("price", 0)
-            delta = target_value - current_value
-
-            if abs(delta) < 50:  # $50 threshold
-                action = "hold"
-            elif delta > 0:
-                action = "enter" if current_value == 0 else "buy"
-            else:
-                action = "sell"
-
-            delta_record = {
-                "symbol": alloc.symbol,
-                "target_value": target_value,
-                "current_value": current_value,
-                "suggested_trade_value": delta,
-                "action": action,
-                "current_price": current_price,
-                "notes": f"Buffett sleeve: {alloc.asset_name or ''}",
-            }
-            deltas.append(delta_record)
-
-            # Create proposed trade if action needed
-            if action in ("enter", "buy"):
-                proposed_trades.append(
-                    ProposedTrade(
-                        symbol=alloc.symbol,
-                        side="buy",
-                        notional=delta,
-                        rationale=f"13F target: ${target_value:,.0f}",
-                    )
+        for t in delta_result.trades:
+            proposed_trades.append(
+                ProposedTrade(
+                    symbol=t.symbol,
+                    side=t.side,
+                    notional=float(t.notional),
+                    delta_weight=float(t.weight_delta),
+                    target_weight=float(t.target_weight),
+                    rationale=t.rationale,
                 )
-            elif action == "sell":
-                proposed_trades.append(
-                    ProposedTrade(
-                        symbol=alloc.symbol,
-                        side="sell",
-                        notional=abs(delta),
-                        rationale=f"13F target: ${target_value:,.0f}",
-                    )
-                )
+            )
+            # Build delta record for audit trail
+            deltas.append({
+                "symbol": t.symbol,
+                "side": t.side,
+                "notional": float(t.notional),
+                "weight_delta": float(t.weight_delta),
+                "target_weight": float(t.target_weight),
+                "rationale": t.rationale,
+            })
 
-        total_buy = sum(d["suggested_trade_value"] for d in deltas if d["suggested_trade_value"] > 0)
-        total_sell = sum(abs(d["suggested_trade_value"]) for d in deltas if d["suggested_trade_value"] < 0)
+        total_buy = float(delta_result.total_buy)
+        total_sell = float(delta_result.total_sell)
 
         log.info(
             "reconciliation_calculated",
@@ -254,21 +246,32 @@ class BuffettSignalProcessor:
             total_sell=total_sell,
         )
 
-        # Save reconciliation to disk
+        # Save reconciliation to disk for audit trail
         recon_output = {
             "sleeve": "buffett",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "accession_number": filing.accession_number,
             "report_date": str(filing.report_date),
+            "source": "sleeve_positions_ledger",
             "summary": {
                 "total_buy": total_buy,
                 "total_sell": total_sell,
                 "net_cash_flow": total_sell - total_buy,
-                "position_count": len(deltas),
+                "trade_count": len(proposed_trades),
             },
+            "weight_changes": [
+                {
+                    "symbol": wc.symbol,
+                    "old_weight": float(wc.old_weight),
+                    "new_weight": float(wc.new_weight),
+                    "action": wc.action,
+                }
+                for wc in delta_result.weight_changes
+            ],
             "deltas": deltas,
         }
 
+        RECONCILIATION_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(RECONCILIATION_PATH, "w") as f:
             json.dump(recon_output, f, indent=2)
 

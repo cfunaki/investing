@@ -208,6 +208,10 @@ class ProposedTrade:
     delta_weight: float = 0.0
     rationale: str = ""
 
+    # Price context (captured at proposal time)
+    proposal_price: float | None = None  # Market price when trade was proposed
+    bravos_entry_price: float | None = None  # Bravos's original entry price (if available)
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -217,8 +221,10 @@ class ProposedTrade:
             "quantity": self.quantity,
             "current_weight": self.current_weight,
             "target_weight": self.target_weight,
-            "delta_weight": self.delta_weight,
+            "weight_delta": self.delta_weight,  # Map to expected key for ledger updates
             "rationale": self.rationale,
+            "proposal_price": self.proposal_price,
+            "bravos_entry_price": self.bravos_entry_price,
         }
 
 

@@ -73,6 +73,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize Telegram bot: {e}")
 
+    # Download Robinhood session pickle from GCS (if available)
+    try:
+        from src.brokers.robinhood import download_rh_session_from_gcs
+        if download_rh_session_from_gcs():
+            logger.info("Robinhood session restored from GCS")
+        else:
+            logger.info("No Robinhood session in GCS (will need /login)")
+    except Exception as e:
+        logger.warning(f"Failed to download RH session from GCS: {e}")
+
     # Verify database connectivity
     try:
         async with get_db_context() as db:

@@ -17,10 +17,11 @@ httpx>=0.26.0
 # Telegram bot
 python-telegram-bot>=20.7
 
-# Gmail API
+# Gmail API + GCS session persistence
 google-auth>=2.26.0
 google-auth-oauthlib>=1.2.0
 google-api-python-client>=2.115.0
+google-cloud-storage>=2.14.0
 
 # Robinhood (existing)
 robin_stocks>=3.0.0

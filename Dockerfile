@@ -35,8 +35,12 @@ ENV PATH=/home/appuser/.local/bin:$PATH
 COPY src/ ./src/
 
 # Create data directories with proper permissions
-RUN mkdir -p /app/data/processed /app/data/state /app/data/sessions && \
-    chown -R appuser:appuser /app/data
+# Also create .tokens dir for robin_stocks credential caching
+RUN mkdir -p /app/data/processed /app/data/state /app/data/sessions /home/appuser/.tokens && \
+    chown -R appuser:appuser /app/data /home/appuser/.tokens
+
+# Copy static state files (entry price cache, etc.)
+COPY data/state/bravos_entry_prices.json ./data/state/
 
 # Set Python path
 ENV PYTHONPATH=/app

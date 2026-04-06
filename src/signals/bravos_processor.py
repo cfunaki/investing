@@ -316,6 +316,46 @@ class BravosSignalProcessor:
                 error=delta_result.error,
             )
 
+        # Step 5: Fetch proposal prices (best-effort)
+        trade_symbols = [t.symbol for t in delta_result.trades]
+        proposal_prices: dict[str, float] = {}
+        if trade_symbols:
+            try:
+                from src.brokers.robinhood import get_robinhood_adapter
+
+                broker = get_robinhood_adapter()
+                quotes = await broker.get_quotes(trade_symbols)
+                proposal_prices = {sym: q.last for sym, q in quotes.items() if q.last}
+                log.info("proposal_prices_fetched", count=len(proposal_prices))
+            except Exception as e:
+                log.warning("proposal_prices_fetch_failed", error=str(e))
+
+        # Step 6: Load Bravos entry prices (best-effort)
+        # Check both the scraped data and the persistent entry price cache
+        bravos_entry_prices: dict[str, float] = {}
+
+        # Source 1: Local scraper format has entryPrice in trades dict
+        trades_data = bravos_data.get("trades", {})
+        for sym, info in trades_data.items():
+            entry = info.get("entryPrice")
+            if entry and entry > 0:
+                bravos_entry_prices[sym.upper()] = float(entry)
+
+        # Source 2: Persistent entry price cache (survives browser worker overwrites)
+        entry_cache_path = Path("data/state/bravos_entry_prices.json")
+        if entry_cache_path.exists():
+            try:
+                with open(entry_cache_path) as f:
+                    cached = json.load(f)
+                for sym, price in cached.items():
+                    if sym.upper() not in bravos_entry_prices and price and price > 0:
+                        bravos_entry_prices[sym.upper()] = float(price)
+            except Exception:
+                pass
+
+        if bravos_entry_prices:
+            log.info("bravos_entry_prices_loaded", count=len(bravos_entry_prices))
+
         # Convert delta trades to ProposedTrade format
         proposed_trades = [
             ProposedTrade(
@@ -323,6 +363,8 @@ class BravosSignalProcessor:
                 side=t.side,
                 notional=float(t.notional),
                 rationale=t.rationale,
+                proposal_price=proposal_prices.get(t.symbol),
+                bravos_entry_price=bravos_entry_prices.get(t.symbol),
             )
             for t in delta_result.trades
         ]

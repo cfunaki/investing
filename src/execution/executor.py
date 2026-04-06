@@ -133,6 +133,7 @@ class TradeExecutor:
 
         report = ExecutionReport(
             approval_id=approval_id,
+            success=False,
             total_trades=len(trades),
             executed=0,
             skipped=0,
@@ -294,6 +295,49 @@ class TradeExecutor:
                 skip_reason="failed_to_acquire_lock",
             )
 
+        # Price deviation check (asymmetric: only skip unfavorable moves)
+        proposal_price = trade.get("proposal_price")
+        if proposal_price:
+            try:
+                current_quote = await self.broker.get_quote(symbol)
+                if current_quote and current_quote.last:
+                    pct_change = (current_quote.last - proposal_price) / proposal_price * 100
+                    from src.config import get_settings
+                    threshold = get_settings().price_deviation_threshold_pct
+
+                    # Buys: skip if price went UP (paying more)
+                    # Sells: skip if price went DOWN (getting less)
+                    unfavorable = (
+                        (side == OrderSide.BUY and pct_change > threshold)
+                        or (side == OrderSide.SELL and pct_change < -threshold)
+                    )
+
+                    log.info(
+                        "price_deviation_check",
+                        proposal_price=proposal_price,
+                        current_price=current_quote.last,
+                        pct_change=round(pct_change, 2),
+                        threshold=threshold,
+                        unfavorable=unfavorable,
+                    )
+
+                    if unfavorable:
+                        await self.idempotency_tracker.mark_failed(execution_key, f"price_deviation:{pct_change:+.1f}%")
+                        return TradeResult(
+                            symbol=symbol,
+                            side=side.value,
+                            success=False,
+                            execution_key=execution_key,
+                            skipped=True,
+                            skip_reason=f"price_deviation:{pct_change:+.1f}%",
+                        )
+                else:
+                    log.warning("price_deviation_check_no_quote", symbol=symbol)
+            except Exception as e:
+                log.warning("price_deviation_check_failed", error=str(e))
+        else:
+            log.info("price_deviation_check_skipped", reason="no_proposal_price")
+
         # Create order request
         request = OrderRequest(
             symbol=symbol,
@@ -384,25 +428,52 @@ class TradeExecutor:
         lines.append(f"Failed: {report.failed}")
         lines.append("")
 
-        if report.results:
-            lines.append("*Results:*")
-            for result in report.results[:10]:  # Limit to 10
-                emoji = "" if result.success else "" if result.skipped else ""
-                status = result.skip_reason if result.skipped else result.status
+        # Group results by outcome
+        executed = [r for r in report.results if r.success]
+        skipped = [r for r in report.results if r.skipped]
+        failed = [r for r in report.results if not r.success and not r.skipped]
 
-                if result.success and result.filled_notional:
-                    lines.append(
-                        f"  {emoji} {result.symbol} {result.side.upper()}: "
-                        f"${result.filled_notional:.2f}"
-                    )
-                else:
-                    lines.append(f"  {emoji} {result.symbol}: {status}")
+        if executed:
+            lines.append("*Executed:*")
+            for r in executed[:10]:
+                price_str = f" @ ${r.filled_price:.2f}" if r.filled_price else ""
+                lines.append(f"  {r.symbol} {r.side.upper()}: ${r.filled_notional or 0:.0f}{price_str}")
+            if len(executed) > 10:
+                lines.append(f"  ... and {len(executed) - 10} more")
 
-            if len(report.results) > 10:
-                lines.append(f"  ... and {len(report.results) - 10} more")
+        if skipped:
+            # Separate price drift skips from other skips
+            price_skips = [r for r in skipped if r.skip_reason and "price_deviation" in r.skip_reason]
+            other_skips = [r for r in skipped if not r.skip_reason or "price_deviation" not in r.skip_reason]
+
+            if price_skips:
+                lines.append("")
+                lines.append(f"*Skipped ({len(price_skips)} price drift):*")
+                for r in price_skips:
+                    deviation = r.skip_reason.split(":")[-1] if r.skip_reason else ""
+                    lines.append(f"  {r.symbol} {r.side.upper()}: {deviation}")
+
+            if other_skips:
+                lines.append("")
+                # Group by reason to avoid repetitive output
+                reasons: dict[str, list[str]] = {}
+                for r in other_skips:
+                    reason = (r.skip_reason or "unknown").replace("_", " ")
+                    reasons.setdefault(reason, []).append(r.symbol)
+                for reason, symbols in reasons.items():
+                    lines.append(f"*Skipped ({len(symbols)} - {reason}):*")
+                    lines.append(f"  {', '.join(symbols)}")
+
+        if failed:
+            lines.append("")
+            lines.append(f"*Failed ({len(failed)}):*")
+            for r in failed[:5]:
+                error_text = (r.error or r.status or "unknown").replace("_", " ")
+                lines.append(f"  {r.symbol}: {error_text}")
 
         if report.error:
-            lines.append(f"\n*Error:* {report.error}")
+            safe_error = report.error.replace("_", " ")
+            lines.append(f"\n*Error:* {safe_error}")
 
         message = "\n".join(lines)
 

@@ -323,6 +323,10 @@ def parse_bravos_weights(bravos_data: dict[str, Any]) -> dict[str, Decimal]:
     """
     Parse Bravos scrape data to extract current weights.
 
+    Handles two formats:
+    - Local scraper: {"trades": {"SYM": {"status": "active", "currentWeight": 5}, ...}}
+    - Browser worker: {"allocations": [{"symbol": "SYM", "target_weight": 0.08, "side": "long"}, ...]}
+
     Args:
         bravos_data: The bravos_trades.json data structure
 
@@ -330,14 +334,47 @@ def parse_bravos_weights(bravos_data: dict[str, Any]) -> dict[str, Decimal]:
         Dict of symbol -> weight (Decimal)
     """
     weights = {}
-    trades = bravos_data.get("trades", {})
 
+    # Browser worker format: list of Allocation objects with raw_weight
+    allocations = bravos_data.get("allocations")
+    if allocations and isinstance(allocations, list):
+        for alloc in allocations:
+            symbol = alloc.get("symbol", "").upper()
+            raw_weight = alloc.get("raw_weight", 0)
+            if symbol and raw_weight and raw_weight > 0:
+                weights[symbol] = Decimal(str(raw_weight))
+        return weights
+
+    # Local scraper format: dict of trade objects keyed by symbol
+    trades = bravos_data.get("trades", {})
     for symbol, trade_info in trades.items():
         if trade_info.get("status") == "active":
             weight = trade_info.get("currentWeight", 0)
             if weight and weight > 0:
                 weights[symbol.upper()] = Decimal(str(weight))
 
+    return weights
+
+
+def parse_buffett_weights(allocations: list) -> dict[str, Decimal]:
+    """
+    Parse Buffett allocations to weight dict.
+
+    The Buffett adapter returns Allocation objects with raw_weight
+    (integer weights from weight_bucket_to_integer() based on portfolio %).
+    This maps nicely to unit-based sizing.
+
+    Args:
+        allocations: List of Allocation objects from Buffett13FAdapter
+
+    Returns:
+        Dict of symbol -> weight (Decimal)
+    """
+    weights = {}
+    for alloc in allocations:
+        raw_weight = getattr(alloc, "raw_weight", None)
+        if raw_weight and raw_weight > 0:
+            weights[alloc.symbol.upper()] = Decimal(str(raw_weight))
     return weights
 
 
