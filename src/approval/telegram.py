@@ -207,13 +207,15 @@ class TelegramBot:
 
     @staticmethod
     def _format_price_context(trade: dict[str, Any]) -> str:
-        """Format price context: % change from Bravos entry price."""
+        """Format price context: current price and % change from Bravos entry."""
         proposal_price = trade.get("proposal_price")
         bravos_entry = trade.get("bravos_entry_price")
 
         if proposal_price and bravos_entry and bravos_entry > 0:
             pct_diff = (proposal_price - bravos_entry) / bravos_entry * 100
-            return f"  ({pct_diff:+.1f}% from entry)"
+            return f"  @${proposal_price:,.2f} ({pct_diff:+.1f}%)"
+        elif proposal_price:
+            return f"  @${proposal_price:,.2f}"
 
         return ""
 
