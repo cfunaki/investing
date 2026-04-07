@@ -28,6 +28,10 @@ CREATE TABLE IF NOT EXISTS queued_executions (
 CREATE INDEX IF NOT EXISTS idx_queued_executions_status
     ON queued_executions(status, execute_after);
 
+-- Prevent duplicate queuing of the same approval
+CREATE UNIQUE INDEX IF NOT EXISTS idx_queued_executions_approval_pending
+    ON queued_executions(approval_id) WHERE status = 'pending';
+
 -- Seed entry_prices from known values
 INSERT INTO entry_prices (symbol, price, source) VALUES
     ('ALUM', 3.85, 'cache_import'),

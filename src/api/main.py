@@ -922,10 +922,11 @@ async def job_execute_queued():
                         db, queued.id, "executing"
                     )
 
-                # Execute the trades
+                # Execute the trades (from_queue=True prevents re-queuing on holidays)
                 report = await execute_approved_trades(
                     approval_id=queued.approval_id,
                     trades=queued.trades,
+                    from_queue=True,
                 )
 
                 if report.success:

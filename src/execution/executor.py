@@ -113,6 +113,7 @@ class TradeExecutor:
         self,
         approval_id: UUID,
         trades: list[dict[str, Any]],
+        from_queue: bool = False,
     ) -> ExecutionReport:
         """
         Execute a batch of approved trades.
@@ -171,12 +172,13 @@ class TradeExecutor:
         report.safety_report = safety_report
 
         if not safety_report.passed:
-            # Check if the ONLY failure is market_hours
+            # Check if ALL failures are market_hours (not just one)
             failures = safety_report.get_failures()
             market_closed_only = (
-                len(failures) == 1
-                and failures[0].check_name == "market_hours"
+                len(failures) > 0
+                and all(f.check_name == "market_hours" for f in failures)
                 and not self.dry_run
+                and not from_queue  # Don't re-queue when executing from queue
             )
 
             if market_closed_only:
@@ -584,6 +586,7 @@ def get_trade_executor() -> TradeExecutor:
 async def execute_approved_trades(
     approval_id: UUID,
     trades: list[dict[str, Any]],
+    from_queue: bool = False,
 ) -> ExecutionReport:
     """
     Convenience function to execute approved trades.
@@ -591,9 +594,10 @@ async def execute_approved_trades(
     Args:
         approval_id: The approval ID
         trades: List of trades to execute
+        from_queue: If True, skip re-queuing on market closed (prevents loops)
 
     Returns:
         ExecutionReport with results
     """
     executor = get_trade_executor()
-    return await executor.execute_approved_trades(approval_id, trades)
+    return await executor.execute_approved_trades(approval_id, trades, from_queue=from_queue)
