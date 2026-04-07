@@ -83,13 +83,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to download RH session from GCS: {e}")
 
-    # Verify database connectivity
+    # Verify database connectivity and run migrations
     try:
         async with get_db_context() as db:
             await db.execute(text("SELECT 1"))
         logger.info("Database connection verified")
+
+        from src.db.migrator import run_migrations
+        await run_migrations()
     except Exception as e:
-        logger.error(f"Database connection failed: {e}")
+        logger.error(f"Database startup failed: {e}")
 
     # Check browser worker connectivity (non-blocking)
     try:
