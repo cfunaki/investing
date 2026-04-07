@@ -83,13 +83,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to download RH session from GCS: {e}")
 
-    # Verify database connectivity
+    # Verify database connectivity and run migrations
     try:
         async with get_db_context() as db:
             await db.execute(text("SELECT 1"))
         logger.info("Database connection verified")
+
+        from src.db.migrator import run_migrations
+        await run_migrations()
     except Exception as e:
-        logger.error(f"Database connection failed: {e}")
+        logger.error(f"Database startup failed: {e}")
 
     # Check browser worker connectivity (non-blocking)
     try:
@@ -313,10 +316,15 @@ async def job_poll_email(background_tasks: BackgroundTasks):
     try:
         log.info("starting_email_poll")
 
-        # TODO: Load processed message IDs from database
-        # For now, we process all found emails
-        # In production, query signals table for existing source_event_ids
-        processed_ids: set[str] = set()
+        # Load already-processed message IDs from database
+        from src.signals.bravos_detector import get_bravos_detector
+        try:
+            detector = get_bravos_detector()
+            processed_ids = await detector.get_processed_message_ids()
+            log.info("loaded_processed_ids", count=len(processed_ids))
+        except Exception as e:
+            log.warning("failed_to_load_processed_ids", error=str(e))
+            processed_ids = set()
 
         # Poll for new emails
         emails = await poll_for_bravos_emails(processed_ids=processed_ids)
@@ -406,13 +414,7 @@ async def job_poll_email(background_tasks: BackgroundTasks):
 
     except Exception as e:
         log.exception("email_poll_failed", error=str(e))
-        return JobResponse(
-            job="poll_email",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/jobs/reconcile", response_model=JobResponse, tags=["Jobs"])
@@ -486,13 +488,7 @@ async def job_reconcile(sleeve: str = "bravos"):
 
     except Exception as e:
         log.exception("reconcile_failed", error=str(e))
-        return JobResponse(
-            job="reconcile",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/jobs/poll-buffett", response_model=JobResponse, tags=["Jobs"])
@@ -551,13 +547,7 @@ async def job_poll_buffett(force: bool = False):
 
     except Exception as e:
         log.exception("buffett_poll_failed", error=str(e))
-        return JobResponse(
-            job="poll_buffett",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/jobs/expire-approvals", response_model=JobResponse, tags=["Jobs"])
@@ -591,13 +581,7 @@ async def job_expire_approvals():
 
     except Exception as e:
         log.exception("approval_expiration_failed", error=str(e))
-        return JobResponse(
-            job="expire_approvals",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
@@ -892,10 +876,129 @@ async def job_poll_bravos(force: bool = False, skip_scrape: bool = False):
 
     except Exception as e:
         log.exception("bravos_poll_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/jobs/execute-queued", response_model=JobResponse, tags=["Jobs"])
+async def job_execute_queued():
+    """
+    Scheduled job: Execute trades queued for market open.
+
+    Called by Cloud Scheduler at 9:31 AM ET on weekdays.
+    """
+    started_at = datetime.now(timezone.utc)
+    log = structlog.get_logger(__name__).bind(job="execute_queued")
+
+    try:
+        log.info("starting_queued_execution")
+
+        from src.db.repositories.state_repository import state_repository
+        from src.db.session import get_db_context
+        from src.execution.executor import execute_approved_trades
+
+        async with get_db_context() as db:
+            pending = await state_repository.get_pending_executions(
+                db, before=datetime.now(timezone.utc)
+            )
+
+        if not pending:
+            log.info("no_queued_executions")
+            return JobResponse(
+                job="execute_queued",
+                status="completed",
+                started_at=started_at.isoformat(),
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                results={"executed": 0, "queued_count": 0},
+            )
+
+        log.info("found_queued_executions", count=len(pending))
+
+        executed = 0
+        failed = 0
+        results = []
+
+        for queued in pending:
+            try:
+                # Mark as executing
+                async with get_db_context() as db:
+                    await state_repository.update_queued_status(
+                        db, queued.id, "executing"
+                    )
+
+                # Execute the trades (from_queue=True prevents re-queuing on holidays)
+                report = await execute_approved_trades(
+                    approval_id=queued.approval_id,
+                    trades=queued.trades,
+                    from_queue=True,
+                )
+
+                if report.success:
+                    async with get_db_context() as db:
+                        await state_repository.update_queued_status(
+                            db, queued.id, "completed"
+                        )
+                    executed += 1
+                    results.append({
+                        "queued_id": str(queued.id),
+                        "success": True,
+                        "executed": report.executed,
+                    })
+                else:
+                    async with get_db_context() as db:
+                        await state_repository.update_queued_status(
+                            db, queued.id, "failed", error=report.error
+                        )
+                    failed += 1
+                    results.append({
+                        "queued_id": str(queued.id),
+                        "success": False,
+                        "error": report.error,
+                    })
+
+            except Exception as e:
+                log.exception(
+                    "queued_execution_failed",
+                    queued_id=str(queued.id),
+                    error=str(e),
+                )
+                async with get_db_context() as db:
+                    await state_repository.update_queued_status(
+                        db, queued.id, "failed", error=str(e)
+                    )
+                failed += 1
+                results.append({
+                    "queued_id": str(queued.id),
+                    "success": False,
+                    "error": str(e),
+                })
+
+        # Notify results
+        try:
+            from src.approval.telegram import get_telegram_bot
+            bot = get_telegram_bot()
+            await bot.send_notification(
+                f"*Queued Execution Complete*\n\n"
+                f"Executed: {executed}\n"
+                f"Failed: {failed}",
+            )
+        except Exception:
+            pass
+
+        log.info("queued_execution_completed", executed=executed, failed=failed)
+
         return JobResponse(
-            job="poll_bravos",
-            status="failed",
+            job="execute_queued",
+            status="completed",
             started_at=started_at.isoformat(),
             completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
+            results={
+                "queued_count": len(pending),
+                "executed": executed,
+                "failed": failed,
+                "details": results,
+            },
         )
+
+    except Exception as e:
+        log.exception("execute_queued_job_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))

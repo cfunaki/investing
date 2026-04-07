@@ -113,6 +113,7 @@ class TradeExecutor:
         self,
         approval_id: UUID,
         trades: list[dict[str, Any]],
+        from_queue: bool = False,
     ) -> ExecutionReport:
         """
         Execute a batch of approved trades.
@@ -171,6 +172,59 @@ class TradeExecutor:
         report.safety_report = safety_report
 
         if not safety_report.passed:
+            # Check if ALL failures are market_hours (not just one)
+            failures = safety_report.get_failures()
+            market_closed_only = (
+                len(failures) > 0
+                and all(f.check_name == "market_hours" for f in failures)
+                and not self.dry_run
+                and not from_queue  # Don't re-queue when executing from queue
+            )
+
+            if market_closed_only:
+                # Queue for next market open instead of failing
+                try:
+                    from src.db.repositories.state_repository import state_repository
+                    from src.db.session import get_db_context
+                    from src.execution.safety import next_market_open
+
+                    execute_after = next_market_open()
+                    async with get_db_context() as db:
+                        queued = await state_repository.queue_execution(
+                            db=db,
+                            approval_id=approval_id,
+                            trades=trades,
+                            execute_after=execute_after,
+                        )
+
+                    log.info(
+                        "trades_queued_for_market_open",
+                        queued_id=str(queued.id),
+                        execute_after=execute_after.isoformat(),
+                    )
+
+                    # Notify via Telegram
+                    try:
+                        from src.approval.telegram import get_telegram_bot
+                        bot = get_telegram_bot()
+                        symbols = ", ".join(t["symbol"] for t in trades)
+                        await bot.send_notification(
+                            f"*Trades Queued*\n\n"
+                            f"Market is closed. {len(trades)} trade(s) ({symbols}) "
+                            f"queued for execution at {execute_after.strftime('%Y-%m-%d %H:%M UTC')}.\n\n"
+                            f"Use /cancel\\_queued to cancel.",
+                        )
+                    except Exception as e:
+                        log.warning("queued_notification_failed", error=str(e))
+
+                    report.success = True
+                    report.error = "queued_for_market_open"
+                    report.completed_at = datetime.now(timezone.utc)
+                    return report
+                except Exception as e:
+                    log.exception("failed_to_queue_trades", error=str(e))
+                    # Fall through to normal failure handling
+
             log.warning(
                 "safety_checks_failed",
                 failures=[c.check_name for c in safety_report.get_failures()],
@@ -532,6 +586,7 @@ def get_trade_executor() -> TradeExecutor:
 async def execute_approved_trades(
     approval_id: UUID,
     trades: list[dict[str, Any]],
+    from_queue: bool = False,
 ) -> ExecutionReport:
     """
     Convenience function to execute approved trades.
@@ -539,9 +594,10 @@ async def execute_approved_trades(
     Args:
         approval_id: The approval ID
         trades: List of trades to execute
+        from_queue: If True, skip re-queuing on market closed (prevents loops)
 
     Returns:
         ExecutionReport with results
     """
     executor = get_trade_executor()
-    return await executor.execute_approved_trades(approval_id, trades)
+    return await executor.execute_approved_trades(approval_id, trades, from_queue=from_queue)

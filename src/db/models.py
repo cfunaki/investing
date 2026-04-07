@@ -451,3 +451,58 @@ class IdempotencyKey(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+# =============================================================================
+# SYSTEM RELIABILITY
+# =============================================================================
+
+
+class KeyValueState(Base):
+    """Simple key-value store for runtime state."""
+
+    __tablename__ = "key_value_state"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class EntryPrice(Base):
+    """Bravos entry prices — write-once per symbol."""
+
+    __tablename__ = "entry_prices"
+
+    symbol: Mapped[str] = mapped_column(String, primary_key=True)
+    price: Mapped[float] = mapped_column(Numeric, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class QueuedExecution(Base):
+    """Approved trades waiting for market open."""
+
+    __tablename__ = "queued_executions"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    approval_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("approvals.id"), nullable=False
+    )
+    trades: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    queued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    execute_after: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    executed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(String, nullable=True)

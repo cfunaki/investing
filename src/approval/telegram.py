@@ -119,6 +119,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("holdings", self._cmd_holdings))
         app.add_handler(CommandHandler("portfolio", self._cmd_portfolio))
         app.add_handler(CommandHandler("login", self._cmd_login))
+        app.add_handler(CommandHandler("cancel_queued", self._cmd_cancel_queued))
 
         # Callback query handler for inline buttons
         app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -1015,6 +1016,44 @@ class TelegramBot:
             self._pending_mfa_future = None
             logger.exception("login_command_failed", error=str(e))
             await update.message.reply_text(f"Login error: {str(e)}")
+
+    async def _cmd_cancel_queued(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /cancel_queued command - cancel pending queued executions."""
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            await update.message.reply_text("Unauthorized")
+            return
+
+        try:
+            from src.db.repositories.state_repository import state_repository
+            from src.db.session import get_db_context
+
+            async with get_db_context() as db:
+                pending = await state_repository.get_pending_executions(db)
+
+                if not pending:
+                    await update.message.reply_text("No queued executions to cancel.")
+                    return
+
+                # Show what will be cancelled
+                lines = [f"*Cancelling {len(pending)} queued execution(s):*\n"]
+                for q in pending:
+                    symbols = ", ".join(t.get("symbol", "?") for t in q.trades)
+                    lines.append(
+                        f"  {symbols} — scheduled {q.execute_after.strftime('%Y-%m-%d %H:%M UTC')}"
+                    )
+
+                count = await state_repository.cancel_pending_executions(db)
+
+            lines.append(f"\n*Cancelled {count} execution(s).*")
+            await update.message.reply_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+            )
+
+        except Exception as e:
+            logger.exception("cancel_queued_failed", error=str(e))
+            await update.message.reply_text(f"Error: {str(e)}")
 
     async def _handle_mfa_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages — captures MFA code if login is in progress."""

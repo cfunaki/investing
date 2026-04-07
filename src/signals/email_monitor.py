@@ -11,6 +11,7 @@ to get the current portfolio state.
 
 import base64
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,21 +120,39 @@ class GmailMonitor:
             except Exception as e:
                 logger.warning("failed_to_load_token_from_file", error=str(e))
 
+        # Priority 3: Check database backup (key_value_state)
+        if not creds:
+            try:
+                import asyncio
+                from src.db.repositories.state_repository import state_repository
+                from src.db.session import get_db_context
+
+                async def _load():
+                    async with get_db_context() as db:
+                        return await state_repository.get_state(db, "gmail_token")
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    future = asyncio.run_coroutine_threadsafe(_load(), loop)
+                    state = future.result(timeout=10)
+                except RuntimeError:
+                    state = asyncio.run(_load())
+
+                if state and state.get("token_json"):
+                    token_data = json.loads(state["token_json"])
+                    creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+                    logger.info("loaded_gmail_token_from_database")
+            except Exception as e:
+                logger.warning("failed_to_load_token_from_database", error=str(e))
+
         # Refresh if expired
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
                 logger.info("refreshed_gmail_credentials")
 
-                # If we loaded from JSON, save refreshed token back to file for debugging
-                if self.token_json and not token_path.exists():
-                    try:
-                        token_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(token_path, "w") as token_file:
-                            token_file.write(creds.to_json())
-                        logger.info("saved_refreshed_token_to_file", path=str(token_path))
-                    except Exception:
-                        pass  # Not critical, Cloud Run may not have writable filesystem
+                # Persist refreshed token to Secret Manager + database
+                self._persist_refreshed_token(creds)
             except Exception as e:
                 logger.warning("failed_to_refresh_credentials", error=str(e))
                 creds = None
@@ -168,6 +187,49 @@ class GmailMonitor:
             logger.info("saved_new_gmail_token", path=str(token_path))
 
         return creds
+
+    def _persist_refreshed_token(self, creds) -> None:
+        """Write refreshed Gmail token to Secret Manager and database."""
+        token_json = creds.to_json()
+
+        # 1. Try Secret Manager
+        try:
+            from google.cloud import secretmanager
+            client = secretmanager.SecretManagerServiceClient()
+            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "investing-automation-490206")
+            secret_path = f"projects/{project_id}/secrets/GMAIL_TOKEN_JSON"
+            client.add_secret_version(
+                request={
+                    "parent": secret_path,
+                    "payload": {"data": token_json.encode("utf-8")},
+                }
+            )
+            logger.info("gmail_token_persisted_to_secret_manager")
+        except Exception as e:
+            logger.warning("gmail_token_secret_manager_write_failed", error=str(e))
+
+        # 2. Backup to database key_value_state
+        try:
+            import asyncio
+            from src.db.repositories.state_repository import state_repository
+            from src.db.session import get_db_context
+
+            async def _save():
+                async with get_db_context() as db:
+                    await state_repository.set_state(db, "gmail_token", {
+                        "token_json": token_json,
+                        "refreshed_at": datetime.now(timezone.utc).isoformat(),
+                    })
+
+            try:
+                loop = asyncio.get_running_loop()
+                future = asyncio.run_coroutine_threadsafe(_save(), loop)
+                future.result(timeout=10)
+            except RuntimeError:
+                asyncio.run(_save())
+            logger.info("gmail_token_persisted_to_database")
+        except Exception as e:
+            logger.warning("gmail_token_database_write_failed", error=str(e))
 
     def _get_service(self):
         """Get Gmail API service (lazy initialization)."""
