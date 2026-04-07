@@ -57,8 +57,11 @@ class Sleeve(Base):
     # Capital allocation
     allocation_mode: Mapped[str] = mapped_column(
         String, nullable=False
-    )  # 'fixed_dollars', 'percent_of_equity'
+    )  # 'fixed_dollars', 'percent_of_equity', 'unit_based'
     allocation_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 4))
+    unit_size: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), default=500.00
+    )  # Dollar amount per weight unit
     cash_handling: Mapped[str] = mapped_column(
         String, default="sleeve_isolated"
     )  # 'sleeve_isolated', 'shared_pool'
@@ -81,6 +84,55 @@ class Sleeve(Base):
         back_populates="sleeve"
     )
     snapshots: Mapped[list["Snapshot"]] = relationship(back_populates="sleeve")
+    positions: Mapped[list["SleevePosition"]] = relationship(back_populates="sleeve")
+
+
+# =============================================================================
+# SLEEVE POSITIONS (Virtual Ledger)
+# =============================================================================
+
+
+class SleevePosition(Base):
+    """
+    Virtual ledger tracking positions per sleeve.
+
+    This is the source of truth for sleeve composition, NOT broker holdings.
+    Tracks shares (not notional) so values don't drift - only changes on trades.
+    """
+
+    __tablename__ = "sleeve_positions"
+    __table_args__ = (
+        Index("idx_sleeve_positions_sleeve", "sleeve_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid4
+    )
+    sleeve_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("sleeves.id", ondelete="CASCADE")
+    )
+    symbol: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Position tracking
+    shares: Mapped[Decimal] = mapped_column(
+        Numeric(16, 6), nullable=False, default=0
+    )
+    weight: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(8, 4)
+    )  # Source weight (e.g., Bravos weight 5)
+    cost_basis: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+
+    # Audit trail
+    last_trade_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    # Relationships
+    sleeve: Mapped["Sleeve"] = relationship(back_populates="positions")
 
 
 # =============================================================================
@@ -399,3 +451,58 @@ class IdempotencyKey(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+# =============================================================================
+# SYSTEM RELIABILITY
+# =============================================================================
+
+
+class KeyValueState(Base):
+    """Simple key-value store for runtime state."""
+
+    __tablename__ = "key_value_state"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class EntryPrice(Base):
+    """Bravos entry prices — write-once per symbol."""
+
+    __tablename__ = "entry_prices"
+
+    symbol: Mapped[str] = mapped_column(String, primary_key=True)
+    price: Mapped[float] = mapped_column(Numeric, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class QueuedExecution(Base):
+    """Approved trades waiting for market open."""
+
+    __tablename__ = "queued_executions"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    approval_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("approvals.id"), nullable=False
+    )
+    trades: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    queued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    execute_after: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    executed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(String, nullable=True)

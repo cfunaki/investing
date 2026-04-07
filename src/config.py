@@ -77,6 +77,10 @@ class Settings(BaseSettings):
         default=None,
         description="Default chat ID for sending notifications",
     )
+    telegram_webhook_url: Optional[str] = Field(
+        default=None,
+        description="Public URL for Telegram webhook (e.g., https://your-service.run.app/webhooks/telegram)",
+    )
 
     @field_validator("telegram_allowed_users", mode="before")
     @classmethod
@@ -131,10 +135,16 @@ class Settings(BaseSettings):
     # Approval Workflow
     # =========================================================================
     approval_expiry_minutes: int = Field(
-        default=10,
-        description="How long approval requests are valid",
+        default=240,
+        description="How long approval requests are valid (4 hours default)",
         ge=1,
-        le=60,
+        le=1440,
+    )
+    price_deviation_threshold_pct: float = Field(
+        default=2.0,
+        description="Max unfavorable price move % before skipping trade at execution time",
+        ge=0.1,
+        le=20.0,
     )
 
     # =========================================================================

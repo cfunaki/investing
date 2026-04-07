@@ -22,9 +22,11 @@ import structlog
 
 from src.approval.telegram import ApprovalRequest, TelegramBot, generate_approval_code, get_telegram_bot
 from src.config import get_settings
+from src.db.models import Reconciliation
 from src.db.repositories.approval_repository import approval_repository
 from src.db.repositories.reconciliation_repository import reconciliation_repository
 from src.db.repositories.sleeve_repository import sleeve_repository
+from src.db.repositories.sleeve_position_repository import sleeve_position_repository
 from src.db.session import get_db_context
 from src.execution.executor import execute_approved_trades
 from src.signals.models import (
@@ -413,10 +415,14 @@ class ApprovalWorkflow:
                 async with get_db_context() as db:
                     db_approval = await approval_repository.get_by_id(db, approval_id)
                     if db_approval:
+                        # Get the sleeve_id from the reconciliation
+                        sleeve_id = await approval_repository.get_sleeve_id_for_approval(
+                            db, approval_id
+                        )
                         record = ApprovalRecord(
                             id=db_approval.id,
                             reconciliation_id=db_approval.reconciliation_id,
-                            sleeve_id=uuid4(),  # Not stored in approval, use placeholder
+                            sleeve_id=sleeve_id or uuid4(),
                             approval_code=db_approval.approval_code,
                             proposed_trades=db_approval.proposed_trades,
                             total_notional=sum(t.get("notional", 0) for t in db_approval.proposed_trades),
@@ -425,7 +431,7 @@ class ApprovalWorkflow:
                         )
                         self._approvals_by_id[approval_id] = record
                         self._approvals[db_approval.approval_code] = record
-                        log.info("loaded_approval_from_database")
+                        log.info("loaded_approval_from_database", sleeve_id=str(sleeve_id))
             except Exception as e:
                 log.warning("failed_to_load_approval_from_db", error=str(e))
 
@@ -472,6 +478,15 @@ class ApprovalWorkflow:
                 failed=execution_report.failed,
             )
 
+            # Update the sleeve ledger after successful execution
+            if execution_report.success and execution_report.executed > 0:
+                await self._update_ledger_after_execution(
+                    record.sleeve_id,
+                    record.proposed_trades,
+                    execution_report,
+                    log,
+                )
+
         except Exception as e:
             log.exception("execution_failed", error=str(e))
             await self.bot.send_notification(
@@ -503,10 +518,13 @@ class ApprovalWorkflow:
                 async with get_db_context() as db:
                     db_approval = await approval_repository.get_by_id(db, approval_id)
                     if db_approval:
+                        sleeve_id = await approval_repository.get_sleeve_id_for_approval(
+                            db, approval_id
+                        )
                         record = ApprovalRecord(
                             id=db_approval.id,
                             reconciliation_id=db_approval.reconciliation_id,
-                            sleeve_id=uuid4(),
+                            sleeve_id=sleeve_id or uuid4(),
                             approval_code=db_approval.approval_code,
                             proposed_trades=db_approval.proposed_trades,
                             total_notional=sum(t.get("notional", 0) for t in db_approval.proposed_trades),
@@ -566,14 +584,103 @@ class ApprovalWorkflow:
             "Re-processing will be implemented in the next phase.",
         )
 
+    async def _update_ledger_after_execution(
+        self,
+        sleeve_id: UUID,
+        proposed_trades: list[dict],
+        execution_report,
+        log,
+    ):
+        """
+        Update the sleeve positions ledger after successful trade execution.
+
+        For each executed trade:
+        - BUY: Add shares to the position (or create new position)
+        - SELL: Remove shares from the position (or delete if full exit)
+        """
+        from decimal import Decimal
+
+        log.info("updating_ledger_after_execution", sleeve_id=str(sleeve_id))
+
+        try:
+            async with get_db_context() as db:
+                for trade in proposed_trades:
+                    symbol = trade.get("symbol", "").upper()
+                    side = trade.get("side", "").lower()
+                    notional = Decimal(str(trade.get("notional", 0)))
+
+                    # Find the matching execution result
+                    exec_result = next(
+                        (r for r in execution_report.results
+                         if r.symbol == symbol and r.success),
+                        None
+                    )
+
+                    if not exec_result:
+                        log.warning("no_execution_result_for_trade", symbol=symbol)
+                        continue
+
+                    # Get shares from execution result or estimate from notional
+                    shares = Decimal(str(exec_result.quantity or 0))
+                    if shares == 0 and exec_result.fill_price:
+                        shares = notional / Decimal(str(exec_result.fill_price))
+
+                    # Get weight from trade data
+                    weight = Decimal(str(trade.get("weight_delta", 0)))
+                    if weight < 0:
+                        weight = abs(weight)
+
+                    if side == "buy":
+                        # For new positions, weight is the target weight
+                        target_weight = Decimal(str(trade.get("target_weight", weight)))
+                        await sleeve_position_repository.add_shares(
+                            db,
+                            sleeve_id=sleeve_id,
+                            symbol=symbol,
+                            shares_delta=shares,
+                            weight=target_weight if target_weight > 0 else None,
+                            cost_delta=notional,
+                        )
+                        log.info("ledger_added_shares", symbol=symbol, shares=float(shares))
+
+                    elif side == "sell":
+                        # Check if this is a full exit (weight going to 0)
+                        new_weight = Decimal(str(trade.get("target_weight", 0)))
+                        if new_weight == 0:
+                            # Full exit - delete position
+                            await sleeve_position_repository.delete_position(
+                                db, sleeve_id, symbol
+                            )
+                            log.info("ledger_deleted_position", symbol=symbol)
+                        else:
+                            # Partial sell - reduce shares
+                            result = await sleeve_position_repository.remove_shares(
+                                db, sleeve_id, symbol, shares
+                            )
+                            if result:
+                                await sleeve_position_repository.update_position(
+                                    db, result, weight=new_weight
+                                )
+                            log.info("ledger_removed_shares", symbol=symbol, shares=float(shares))
+
+                await db.commit()
+                log.info("ledger_update_complete")
+
+        except Exception as e:
+            log.exception("ledger_update_failed", error=str(e))
+            # Don't fail the approval - trades are already executed
+            # Just log the error for manual reconciliation
+
     async def expire_pending_approvals(self) -> int:
         """
         Expire any pending approvals that have passed their expiration time.
+        Auto-retriggers a new approval with the same trades.
 
         Returns:
             Number of approvals expired
         """
         expired_count = 0
+        to_retrigger: list[tuple[ApprovalRecord, str | None]] = []  # (record, sleeve_name)
         now = datetime.now(timezone.utc)
 
         # Expire in-memory approvals
@@ -591,10 +698,12 @@ class ApprovalWorkflow:
                 # Update Telegram message
                 await self.bot.update_approval_message(
                     code,
-                    f"*Approval Expired*\n"
+                    f"*Approval Expired — resending...*\n"
                     f"Code: `{code}`\n"
                     f"Expired at: {now.strftime('%Y-%m-%d %H:%M UTC')}",
                 )
+
+                to_retrigger.append((record, None))
 
         # Expire database approvals
         try:
@@ -610,10 +719,116 @@ class ApprovalWorkflow:
                             approval_code=db_approval.approval_code,
                             approval_id=str(db_approval.id),
                         )
+                        # Resolve sleeve_id from reconciliation
+                        recon = await db.get(Reconciliation, db_approval.reconciliation_id)
+                        db_sleeve_id = recon.sleeve_id if recon else uuid4()
+
+                        retrigger_record = ApprovalRecord(
+                            id=db_approval.id,
+                            reconciliation_id=db_approval.reconciliation_id,
+                            sleeve_id=db_sleeve_id,
+                            approval_code=db_approval.approval_code,
+                            proposed_trades=db_approval.proposed_trades,
+                            total_notional=sum(
+                                abs(t.get("notional", 0)) for t in db_approval.proposed_trades
+                            ),
+                        )
+                        to_retrigger.append((retrigger_record, None))
         except Exception as e:
             logger.warning("failed_to_expire_db_approvals", error=str(e))
 
+        # Auto-retrigger expired approvals
+        for record, _ in to_retrigger:
+            try:
+                await self._retrigger_approval(record)
+            except Exception as e:
+                logger.warning(
+                    "auto_retrigger_failed",
+                    approval_id=str(record.id),
+                    error=str(e),
+                )
+
         return expired_count
+
+    async def _retrigger_approval(self, expired_record: ApprovalRecord) -> None:
+        """Create a new approval from an expired one with the same trades."""
+        settings = get_settings()
+        new_code = generate_approval_code()
+        requested_at = datetime.now(timezone.utc)
+        expires_at = requested_at + timedelta(minutes=settings.approval_expiry_minutes)
+
+        # Resolve sleeve name from sleeve_id
+        sleeve_name = "unknown"
+        sleeve_id = expired_record.sleeve_id
+        try:
+            async with get_db_context() as db:
+                sleeve = await sleeve_repository.get_by_id(db, expired_record.sleeve_id)
+                if sleeve:
+                    sleeve_name = sleeve.name
+                    sleeve_id = sleeve.id
+
+                # Create new approval in DB linked to same reconciliation
+                new_db_approval = await approval_repository.create(
+                    db=db,
+                    reconciliation_id=expired_record.reconciliation_id,
+                    approval_code=new_code,
+                    proposed_trades=expired_record.proposed_trades,
+                    requested_at=requested_at,
+                    expires_at=expires_at,
+                )
+                new_approval_id = new_db_approval.id
+
+        except Exception as e:
+            logger.warning("retrigger_db_failed", error=str(e))
+            new_approval_id = uuid4()
+
+        # Create in-memory record
+        new_record = ApprovalRecord(
+            id=new_approval_id,
+            reconciliation_id=expired_record.reconciliation_id,
+            sleeve_id=sleeve_id,
+            approval_code=new_code,
+            proposed_trades=expired_record.proposed_trades,
+            total_notional=expired_record.total_notional,
+            expires_at=expires_at,
+        )
+
+        # Send to Telegram
+        request = ApprovalRequest(
+            approval_id=new_record.id,
+            reconciliation_id=expired_record.reconciliation_id,
+            sleeve_name=sleeve_name,
+            proposed_trades=new_record.proposed_trades,
+            total_notional=new_record.total_notional,
+            approval_code=new_code,
+            expires_at=expires_at,
+        )
+
+        message_id = await self.bot.send_approval_request(request)
+
+        if message_id:
+            new_record.telegram_message_id = message_id
+            self._approvals[new_code] = new_record
+            self._approvals_by_id[new_record.id] = new_record
+
+            # Update message ID in DB
+            try:
+                async with get_db_context() as db:
+                    await approval_repository.set_telegram_message_id(
+                        db, new_approval_id, str(message_id)
+                    )
+            except Exception:
+                pass
+
+            logger.info(
+                "auto_retriggered_expired_approval",
+                old_code=expired_record.approval_code,
+                new_code=new_code,
+                sleeve=sleeve_name,
+                expires_at=expires_at.isoformat(),
+            )
+        else:
+            logger.error("auto_retrigger_telegram_failed", new_code=new_code)
 
     def get_pending_approvals(self) -> list[ApprovalRecord]:
         """Get all pending approval records from in-memory cache."""

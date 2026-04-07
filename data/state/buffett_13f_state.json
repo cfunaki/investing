@@ -1,0 +1,17 @@
+{
+  "last_processed_accession": "0001193125-26-054580",
+  "last_checked_at": "2026-03-27T19:16:28.999567+00:00",
+  "last_processed_at": "2026-03-27T19:07:17.170763+00:00",
+  "processing_history": [
+    {
+      "accession_number": "0001193125-26-054580",
+      "report_date": "2025-12-31",
+      "processed_at": "2026-03-27T19:07:17.170763+00:00",
+      "details": {
+        "trade_count": 8,
+        "total_buy": 10080,
+        "total_sell": 0
+      }
+    }
+  ]
+}

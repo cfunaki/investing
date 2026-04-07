@@ -13,7 +13,7 @@ These are the last line of defense before real money moves.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -22,6 +22,30 @@ from src.brokers.base import AccountInfo, OrderRequest, OrderSide
 from src.config import get_settings
 
 logger = structlog.get_logger(__name__)
+
+
+def next_market_open() -> datetime:
+    """Calculate the next market open (9:31 AM ET) as UTC datetime."""
+    now = datetime.now(timezone.utc)
+
+    # Approximate ET offset (conservative: use EST = UTC-5)
+    # 9:31 AM ET = 14:31 UTC (EST) or 13:31 UTC (EDT)
+    # Use 14:31 to be safe (market will definitely be open)
+    target_hour_utc = 14
+    target_minute_utc = 31
+
+    # Start from tomorrow
+    candidate = now.replace(
+        hour=target_hour_utc, minute=target_minute_utc, second=0, microsecond=0
+    )
+    if candidate <= now:
+        candidate += timedelta(days=1)
+
+    # Skip weekends
+    while candidate.weekday() >= 5:  # Saturday=5, Sunday=6
+        candidate += timedelta(days=1)
+
+    return candidate
 
 
 @dataclass

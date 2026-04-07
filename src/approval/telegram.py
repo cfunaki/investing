@@ -8,6 +8,7 @@ This module handles:
 - Bot commands for reviewing and managing intents
 """
 
+import asyncio
 import hashlib
 import secrets
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from src.config import get_settings
@@ -96,6 +99,9 @@ class TelegramBot:
         self.on_rejection: callable | None = None
         self.on_retry: callable | None = None
 
+        # MFA login state
+        self._pending_mfa_future: asyncio.Future | None = None
+
     def _build_application(self) -> Application:
         """Build the Telegram application with handlers."""
         app = Application.builder().token(self.token).build()
@@ -112,9 +118,17 @@ class TelegramBot:
         app.add_handler(CommandHandler("bravos", self._cmd_bravos))
         app.add_handler(CommandHandler("holdings", self._cmd_holdings))
         app.add_handler(CommandHandler("portfolio", self._cmd_portfolio))
+        app.add_handler(CommandHandler("login", self._cmd_login))
+        app.add_handler(CommandHandler("cancel_queued", self._cmd_cancel_queued))
 
         # Callback query handler for inline buttons
         app.add_handler(CallbackQueryHandler(self._handle_callback))
+
+        # Message handler for MFA code capture (must be after command handlers)
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_mfa_reply,
+        ))
 
         return app
 
@@ -142,35 +156,69 @@ class TelegramBot:
         expires_at: datetime,
     ) -> str:
         """Format an approval request message."""
+        buys = [t for t in trades if t.get("side", "").lower() == "buy"]
+        sells = [t for t in trades if t.get("side", "").lower() == "sell"]
+
+        total_buy = sum(abs(t.get("notional", 0)) for t in buys)
+        total_sell = sum(abs(t.get("notional", 0)) for t in sells)
+        net = total_buy - total_sell
+
         lines = [
             f"*Trade Approval Request*",
             f"Sleeve: `{sleeve_name}`",
             f"Code: `{approval_code}`",
-            "",
-            "*Proposed Trades:*",
         ]
 
-        for trade in trades[:10]:  # Limit to 10 trades in message
-            symbol = trade.get("symbol", "???")
-            side = trade.get("side", "???").upper()
-            notional = trade.get("notional", 0)
-            delta = trade.get("delta_weight", 0) * 100
+        if buys:
+            lines.append("")
+            lines.append(f"*Buys ({len(buys)}):*")
+            for trade in buys[:10]:
+                symbol = trade.get("symbol", "???")
+                notional = abs(trade.get("notional", 0))
+                line = f"  {symbol}  +${notional:,.0f}"
+                line += self._format_price_context(trade)
+                lines.append(line)
+            if len(buys) > 10:
+                lines.append(f"  ... and {len(buys) - 10} more")
 
-            emoji = "+" if side == "BUY" else "-"
-            lines.append(f"  {emoji} {symbol}: ${abs(notional):,.0f} ({delta:+.1f}%)")
-
-        if len(trades) > 10:
-            lines.append(f"  ... and {len(trades) - 10} more")
+        if sells:
+            lines.append("")
+            lines.append(f"*Sells ({len(sells)}):*")
+            for trade in sells[:10]:
+                symbol = trade.get("symbol", "???")
+                notional = abs(trade.get("notional", 0))
+                line = f"  {symbol}  -${notional:,.0f}"
+                line += self._format_price_context(trade)
+                lines.append(line)
+            if len(sells) > 10:
+                lines.append(f"  ... and {len(sells) - 10} more")
 
         lines.extend([
             "",
-            f"*Total:* ${total_notional:,.2f}",
+            f"*Total Buys:* +${total_buy:,.0f}",
+            f"*Total Sells:* -${total_sell:,.0f}",
+            f"*Net:* {'+'if net >= 0 else '-'}${abs(net):,.0f}",
+            "",
             f"*Expires:* {expires_at.strftime('%H:%M UTC')}",
             "",
             "Tap a button below to respond:",
         ])
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_price_context(trade: dict[str, Any]) -> str:
+        """Format price context: current price and % change from Bravos entry."""
+        proposal_price = trade.get("proposal_price")
+        bravos_entry = trade.get("bravos_entry_price")
+
+        if proposal_price and bravos_entry and bravos_entry > 0:
+            pct_diff = (proposal_price - bravos_entry) / bravos_entry * 100
+            return f"  @${proposal_price:,.2f} ({pct_diff:+.1f}%)"
+        elif proposal_price:
+            return f"  @${proposal_price:,.2f}"
+
+        return ""
 
     def format_review_alert(
         self,
@@ -516,6 +564,7 @@ class TelegramBot:
             "/holdings - Show current holdings\n"
             "/portfolio - Detailed breakdown by sleeve\n\n"
             "*Other:*\n"
+            "/login - Robinhood login via SMS MFA\n"
             "/help - Show this message",
             parse_mode="Markdown",
         )
@@ -898,6 +947,128 @@ class TelegramBot:
             await update.message.reply_text(f"Error: {str(e)}")
 
     # =========================================================================
+    # Login / MFA Commands
+    # =========================================================================
+
+    async def _cmd_login(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /login command - initiate Robinhood login via Telegram MFA."""
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            await update.message.reply_text("Unauthorized")
+            return
+
+        if self._pending_mfa_future is not None:
+            await update.message.reply_text("A login is already in progress. Please wait.")
+            return
+
+        await update.message.reply_text("Starting Robinhood login...")
+
+        try:
+            from src.brokers.robinhood import get_robinhood_adapter, upload_rh_session_to_gcs
+
+            broker = get_robinhood_adapter()
+            chat_id = update.effective_chat.id
+
+            async def send_prompt(text: str):
+                """Send MFA prompt to Telegram."""
+                bot = self.application.bot
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="Markdown",
+                )
+
+            async def wait_for_reply() -> str:
+                """Wait for user to send MFA code."""
+                loop = asyncio.get_event_loop()
+                self._pending_mfa_future = loop.create_future()
+                try:
+                    return await asyncio.wait_for(self._pending_mfa_future, timeout=300)
+                finally:
+                    self._pending_mfa_future = None
+
+            success = await broker.connect_with_telegram_mfa(
+                send_prompt_fn=send_prompt,
+                wait_for_reply_fn=wait_for_reply,
+            )
+
+            if success:
+                await update.message.reply_text(
+                    "*Login Successful*\n\n"
+                    "Robinhood session established and saved to GCS.",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    "*Login Failed*\n\n"
+                    "Check logs for details. Try /login again.",
+                    parse_mode="Markdown",
+                )
+
+        except asyncio.TimeoutError:
+            self._pending_mfa_future = None
+            await update.message.reply_text(
+                "*Login Timed Out*\n\n"
+                "No MFA code received within 5 minutes. Try /login again.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            self._pending_mfa_future = None
+            logger.exception("login_command_failed", error=str(e))
+            await update.message.reply_text(f"Login error: {str(e)}")
+
+    async def _cmd_cancel_queued(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /cancel_queued command - cancel pending queued executions."""
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            await update.message.reply_text("Unauthorized")
+            return
+
+        try:
+            from src.db.repositories.state_repository import state_repository
+            from src.db.session import get_db_context
+
+            async with get_db_context() as db:
+                pending = await state_repository.get_pending_executions(db)
+
+                if not pending:
+                    await update.message.reply_text("No queued executions to cancel.")
+                    return
+
+                # Show what will be cancelled
+                lines = [f"*Cancelling {len(pending)} queued execution(s):*\n"]
+                for q in pending:
+                    symbols = ", ".join(t.get("symbol", "?") for t in q.trades)
+                    lines.append(
+                        f"  {symbols} — scheduled {q.execute_after.strftime('%Y-%m-%d %H:%M UTC')}"
+                    )
+
+                count = await state_repository.cancel_pending_executions(db)
+
+            lines.append(f"\n*Cancelled {count} execution(s).*")
+            await update.message.reply_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+            )
+
+        except Exception as e:
+            logger.exception("cancel_queued_failed", error=str(e))
+            await update.message.reply_text(f"Error: {str(e)}")
+
+    async def _handle_mfa_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle text messages — captures MFA code if login is in progress."""
+        if self._pending_mfa_future is None or self._pending_mfa_future.done():
+            return  # No pending MFA, ignore
+
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            return
+
+        code = update.message.text.strip()
+        logger.info("mfa_reply_received", code_length=len(code))
+        self._pending_mfa_future.set_result(code)
+
+    # =========================================================================
     # Holdings Command
     # =========================================================================
 
@@ -1179,6 +1350,58 @@ class TelegramBot:
             await self._application.updater.stop()
             await self._application.stop()
             await self._application.shutdown()
+
+    async def setup_webhook(self, webhook_url: str) -> bool:
+        """
+        Set up Telegram webhook for receiving updates.
+
+        Args:
+            webhook_url: Public HTTPS URL for the webhook endpoint
+                        (e.g., https://your-service.run.app/webhooks/telegram)
+
+        Returns:
+            True if webhook was set successfully
+        """
+        log = logger.bind(webhook_url=webhook_url)
+
+        try:
+            bot = self.application.bot
+
+            # Delete any existing webhook first
+            await bot.delete_webhook(drop_pending_updates=True)
+
+            # Set the new webhook
+            result = await bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=["message", "callback_query"],
+            )
+
+            if result:
+                log.info("telegram_webhook_set")
+                return True
+            else:
+                log.error("telegram_webhook_failed")
+                return False
+
+        except Exception as e:
+            log.exception("telegram_webhook_setup_error", error=str(e))
+            return False
+
+    async def get_webhook_info(self) -> dict:
+        """Get current webhook configuration."""
+        try:
+            bot = self.application.bot
+            info = await bot.get_webhook_info()
+            return {
+                "url": info.url,
+                "has_custom_certificate": info.has_custom_certificate,
+                "pending_update_count": info.pending_update_count,
+                "last_error_date": info.last_error_date,
+                "last_error_message": info.last_error_message,
+            }
+        except Exception as e:
+            logger.exception("get_webhook_info_failed", error=str(e))
+            return {"error": str(e)}
 
 
 # Singleton instance

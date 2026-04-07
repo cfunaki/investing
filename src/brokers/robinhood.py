@@ -6,13 +6,23 @@ a consistent interface for the execution layer.
 """
 
 import asyncio
+import builtins
+import os
 from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import pyotp
 import robin_stocks.robinhood as rh
 import structlog
+
+# Cloud Storage for session persistence (optional)
+try:
+    from google.cloud import storage as gcs_storage
+    GCS_AVAILABLE = True
+except ImportError:
+    GCS_AVAILABLE = False
 
 from src.brokers.base import (
     AccountInfo,
@@ -29,6 +39,60 @@ from src.brokers.base import (
 from src.config import get_settings
 
 logger = structlog.get_logger(__name__)
+
+# GCS config for RH session pickle persistence
+GCS_SESSION_BUCKET = os.getenv("GCS_SESSION_BUCKET", "investing-automation-sessions")
+GCS_RH_SESSION_PATH = "sessions/robinhood.pickle"
+# robin_stocks stores pickle at ~/.tokens/robinhood.pickle
+LOCAL_RH_PICKLE = Path.home() / ".tokens" / "robinhood.pickle"
+
+
+def download_rh_session_from_gcs() -> bool:
+    """Download Robinhood session pickle from GCS if available."""
+    if not GCS_AVAILABLE or not GCS_SESSION_BUCKET:
+        logger.info("gcs_not_available_for_rh_session")
+        return False
+
+    try:
+        client = gcs_storage.Client()
+        bucket = client.bucket(GCS_SESSION_BUCKET)
+        blob = bucket.blob(GCS_RH_SESSION_PATH)
+
+        if not blob.exists():
+            logger.info("gcs_rh_session_not_found")
+            return False
+
+        LOCAL_RH_PICKLE.parent.mkdir(parents=True, exist_ok=True)
+        blob.download_to_filename(str(LOCAL_RH_PICKLE))
+        logger.info("gcs_rh_session_downloaded", local_path=str(LOCAL_RH_PICKLE))
+        return True
+
+    except Exception as e:
+        logger.warning("gcs_rh_session_download_failed", error=str(e))
+        return False
+
+
+def upload_rh_session_to_gcs() -> bool:
+    """Upload Robinhood session pickle to GCS for persistence."""
+    if not GCS_AVAILABLE or not GCS_SESSION_BUCKET:
+        logger.info("gcs_not_available_for_rh_session_upload")
+        return False
+
+    if not LOCAL_RH_PICKLE.exists():
+        logger.warning("rh_pickle_not_found", path=str(LOCAL_RH_PICKLE))
+        return False
+
+    try:
+        client = gcs_storage.Client()
+        bucket = client.bucket(GCS_SESSION_BUCKET)
+        blob = bucket.blob(GCS_RH_SESSION_PATH)
+        blob.upload_from_filename(str(LOCAL_RH_PICKLE))
+        logger.info("gcs_rh_session_uploaded")
+        return True
+
+    except Exception as e:
+        logger.warning("gcs_rh_session_upload_failed", error=str(e))
+        return False
 
 
 def _run_sync(func, *args, **kwargs):
@@ -100,11 +164,100 @@ class RobinhoodAdapter(BrokerAdapter):
                 return True
             else:
                 log.error("robinhood_login_failed")
+                await self._notify_session_expired()
                 return False
 
         except Exception as e:
             log.exception("robinhood_connection_error", error=str(e))
+            await self._notify_session_expired()
             return False
+
+    async def _notify_session_expired(self) -> None:
+        """Send Telegram notification when RH session expires."""
+        try:
+            from src.approval.telegram import get_telegram_bot
+            bot = get_telegram_bot()
+            await bot.send_notification(
+                "*Robinhood Session Expired*\n\n"
+                "Login failed (session pickle expired or MFA needed).\n"
+                "Use /login to re-authenticate via SMS MFA.",
+            )
+        except Exception as e:
+            logger.warning("failed_to_send_session_expiry_notification", error=str(e))
+
+    async def connect_with_telegram_mfa(
+        self,
+        send_prompt_fn,
+        wait_for_reply_fn,
+    ) -> bool:
+        """
+        Login to Robinhood using Telegram as the MFA input medium.
+
+        Monkey-patches builtins.input() so that when robin_stocks calls
+        input() for the SMS MFA code, it sends a Telegram prompt and
+        waits for the user's reply.
+
+        Args:
+            send_prompt_fn: async callable(str) to send a message to Telegram
+            wait_for_reply_fn: async callable() -> str to wait for user's reply
+
+        Returns:
+            True if login succeeded
+        """
+        log = logger.bind(broker="robinhood", method="telegram_mfa")
+        log.info("starting_telegram_mfa_login")
+
+        loop = asyncio.get_event_loop()
+        original_input = builtins.input
+
+        def patched_input(prompt=""):
+            """Replacement for input() that uses Telegram."""
+            log.info("mfa_input_requested", prompt=prompt)
+
+            # Send the prompt to Telegram and wait for reply
+            future = asyncio.run_coroutine_threadsafe(
+                send_prompt_fn(f"*Robinhood MFA*\n\n{prompt}"),
+                loop,
+            )
+            future.result(timeout=10)  # Wait for message to send
+
+            # Wait for the user's reply
+            reply_future = asyncio.run_coroutine_threadsafe(
+                wait_for_reply_fn(),
+                loop,
+            )
+            reply = reply_future.result(timeout=300)  # 5 minute timeout
+            log.info("mfa_code_received")
+            return reply.strip()
+
+        try:
+            builtins.input = patched_input
+
+            # Run rh.login() in a thread (it's synchronous)
+            result = await _run_sync(
+                rh.login,
+                username=self._username,
+                password=self._password,
+                store_session=True,
+            )
+
+            if result:
+                self._connected = True
+                log.info("telegram_mfa_login_success")
+
+                # Upload session to GCS for persistence
+                upload_rh_session_to_gcs()
+
+                return True
+            else:
+                log.error("telegram_mfa_login_failed")
+                return False
+
+        except Exception as e:
+            log.exception("telegram_mfa_login_error", error=str(e))
+            return False
+        finally:
+            builtins.input = original_input
 
     async def disconnect(self) -> None:
         """Logout from Robinhood."""

@@ -18,8 +18,9 @@ CREATE TABLE sleeves (
     enabled BOOLEAN DEFAULT true,
 
     -- Capital allocation
-    allocation_mode TEXT NOT NULL,     -- 'fixed_dollars', 'percent_of_equity'
+    allocation_mode TEXT NOT NULL,     -- 'fixed_dollars', 'percent_of_equity', 'unit_based'
     allocation_value DECIMAL(12,4),    -- e.g., 10000.00 or 0.25
+    unit_size DECIMAL(10,2) DEFAULT 500.00,  -- Dollar amount per weight unit (e.g., $500)
     cash_handling TEXT DEFAULT 'sleeve_isolated',  -- 'sleeve_isolated', 'shared_pool'
     rebalance_priority INT DEFAULT 100, -- Lower = higher priority
 
@@ -29,6 +30,41 @@ CREATE TABLE sleeves (
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- ============================================================================
+-- SLEEVE POSITIONS (Virtual Ledger)
+-- ============================================================================
+-- Tracks what positions belong to each sleeve. This is the source of truth
+-- for sleeve composition, NOT the broker holdings.
+-- Shares-based tracking: shares don't drift, only change on actual trades.
+
+CREATE TABLE sleeve_positions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    sleeve_id UUID NOT NULL REFERENCES sleeves(id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL,
+
+    -- Position tracking
+    shares DECIMAL(16,6) NOT NULL DEFAULT 0,  -- Actual shares held for this sleeve
+    weight DECIMAL(8,4),                       -- Source weight (e.g., Bravos weight 5, not 5%)
+    cost_basis DECIMAL(12,2),                  -- Total cost basis for tax tracking
+
+    -- Audit trail
+    last_trade_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+
+    -- One position per symbol per sleeve
+    UNIQUE(sleeve_id, symbol)
+);
+
+-- Index for looking up positions by sleeve
+CREATE INDEX idx_sleeve_positions_sleeve ON sleeve_positions(sleeve_id);
+
+-- Auto-update timestamp
+CREATE TRIGGER update_sleeve_positions_updated_at
+    BEFORE UPDATE ON sleeve_positions
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
 -- SIGNALS (Trigger Events)
@@ -222,14 +258,24 @@ CREATE TRIGGER update_sleeves_updated_at
 -- INITIAL DATA
 -- ============================================================================
 
--- Insert Bravos as the first sleeve
-INSERT INTO sleeves (name, adapter_type, allocation_mode, allocation_value, config)
+-- Insert Bravos as the first sleeve (unit-based allocation: $500 per weight unit)
+INSERT INTO sleeves (name, adapter_type, allocation_mode, unit_size, config)
 VALUES (
     'bravos',
     'bravos_web',
-    'fixed_dollars',
-    10000.00,
+    'unit_based',
+    500.00,
     '{"poll_interval_minutes": 5, "email_from": "bravos"}'::jsonb
+);
+
+-- Insert Buffett sleeve (unit-based allocation: $240 per weight unit based on 13F weights)
+INSERT INTO sleeves (name, adapter_type, allocation_mode, unit_size, config)
+VALUES (
+    'buffett',
+    'sec_13f',
+    'unit_based',
+    240.00,
+    '{"cik": "0001067983", "top_n_positions": 10, "min_portfolio_weight_pct": 3.0}'::jsonb
 );
 
 -- ============================================================================

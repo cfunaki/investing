@@ -1,28 +1,40 @@
 """
 Bravos sleeve signal processor.
 
-Processes new Bravos portfolio update emails:
+Processes new Bravos portfolio update emails using DELTA-ONLY reconciliation:
 1. Detects new email via Gmail
-2. Triggers the reconciliation pipeline (scrape, normalize, derive, reconcile)
-3. Sends proposed trades to Telegram for approval
-4. Executes trades on approval
+2. Scrapes current Bravos active trades
+3. Compares against virtual ledger (sleeve_positions)
+4. Generates trades ONLY for changed positions
+5. Sends delta trades to Telegram for approval
 
-This integrates the existing Bravos reconciliation with the approval workflow.
+Key principle: Only trade symbols that have changed weights.
+Don't touch other positions in the sleeve.
 """
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import structlog
 
 from src.db.repositories.sleeve_repository import sleeve_repository
+from src.db.repositories.sleeve_position_repository import sleeve_position_repository
 from src.db.session import get_db_context
+from src.reconciliation.delta_reconciler import (
+    DeltaReconciler,
+    DeltaTrade,
+    get_delta_reconciler,
+    parse_bravos_weights,
+)
 from src.signals.bravos_detector import BravosEmailDetector, get_bravos_detector
 from src.signals.models import (
     ProposedTrade,
@@ -33,8 +45,12 @@ from src.signals.models import (
 logger = structlog.get_logger(__name__)
 
 # Paths
+BRAVOS_TRADES_PATH = Path("data/processed/bravos_trades.json")
 RECONCILIATION_PATH = Path("data/processed/reconciliation.json")
 PROPOSED_ORDERS_PATH = Path("data/processed/proposed_orders.json")
+
+# Symbols not available on Robinhood - skip these in reconciliation
+SKIP_SYMBOLS = {"ALUM"}
 
 
 @dataclass
@@ -142,97 +158,228 @@ class BravosSignalProcessor:
                 error=str(e),
             )
 
+    async def _scrape_bravos(self, log) -> dict:
+        """
+        Scrape Bravos active trades using browser worker or local fallback.
+
+        Returns:
+            dict with 'success' key and 'error' if failed
+        """
+        from src.config import get_settings
+
+        settings = get_settings()
+        browser_worker_url = settings.browser_worker_url
+
+        # Try browser worker first (for Cloud Run)
+        if browser_worker_url and not browser_worker_url.startswith("http://localhost"):
+            log.info("scraping_via_browser_worker", url=browser_worker_url)
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(
+                        f"{browser_worker_url}/scrape/bravos",
+                        json={},
+                    )
+
+                    if response.status_code == 200:
+                        data = response.json()
+                        # Save the scraped data
+                        BRAVOS_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                        with open(BRAVOS_TRADES_PATH, "w") as f:
+                            json.dump(data, f, indent=2)
+                        return {"success": True}
+                    else:
+                        log.error(
+                            "browser_worker_scrape_failed",
+                            status=response.status_code,
+                            body=response.text[:200],
+                        )
+                        return {
+                            "success": False,
+                            "error": f"Browser worker returned {response.status_code}",
+                        }
+
+            except httpx.TimeoutException:
+                log.error("browser_worker_timeout")
+                return {"success": False, "error": "Browser worker timeout"}
+            except Exception as e:
+                log.error("browser_worker_error", error=str(e))
+                # Fall through to local fallback
+
+        # Local fallback (for development)
+        log.info("scraping_via_local_subprocess")
+        try:
+            result = subprocess.run(
+                ["npx", "tsx", "scripts/scrape-active-trades.ts"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": f"Local scrape failed: {result.stderr[:200] if result.stderr else 'Unknown'}",
+                }
+
+            return {"success": True}
+
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "Local scrape timed out"}
+        except FileNotFoundError:
+            return {"success": False, "error": "npx not found - use browser worker in production"}
+
     async def _process_reconciliation(
         self,
         email,
         dry_run: bool,
         skip_scrape: bool,
     ) -> BravosProcessingResult:
-        """Run the reconciliation pipeline and calculate trades."""
+        """
+        Run DELTA-ONLY reconciliation.
+
+        Instead of full portfolio reconciliation, this:
+        1. Scrapes current Bravos active trades
+        2. Compares weights against virtual ledger
+        3. Generates trades ONLY for changed symbols
+        """
         log = logger.bind()
 
-        # Run the existing reconciliation pipeline
+        # Step 1: Run scrape if needed (just the Bravos active trades)
         if not skip_scrape:
-            log.info("running_reconciliation_pipeline")
+            log.info("running_bravos_scrape")
             try:
-                # Run the reconciliation script
-                result = subprocess.run(
-                    [sys.executable, "scripts/run-reconcile.py"],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,  # 5 minute timeout
-                )
-
-                if result.returncode != 0:
-                    log.error(
-                        "reconciliation_pipeline_failed",
-                        returncode=result.returncode,
-                        stderr=result.stderr[:500] if result.stderr else None,
-                    )
+                scrape_result = await self._scrape_bravos(log)
+                if not scrape_result["success"]:
                     return BravosProcessingResult(
                         success=False,
                         new_email=True if email else False,
                         message_id=email.message_id if email else None,
-                        error=f"Reconciliation pipeline failed: {result.stderr[:200] if result.stderr else 'Unknown error'}",
+                        error=scrape_result.get("error", "Bravos scrape failed"),
                     )
+                log.info("bravos_scrape_completed")
 
-                log.info("reconciliation_pipeline_completed")
-
-            except subprocess.TimeoutExpired:
-                log.error("reconciliation_pipeline_timeout")
+            except Exception as e:
+                log.error("bravos_scrape_error", error=str(e))
                 return BravosProcessingResult(
                     success=False,
                     new_email=True if email else False,
                     message_id=email.message_id if email else None,
-                    error="Reconciliation pipeline timed out",
+                    error=f"Bravos scrape error: {str(e)}",
                 )
 
-        # Load reconciliation results
-        if not RECONCILIATION_PATH.exists():
+        # Step 2: Load current Bravos weights
+        if not BRAVOS_TRADES_PATH.exists():
             return BravosProcessingResult(
                 success=False,
-                error="No reconciliation file found. Run reconciliation first.",
+                error="No bravos_trades.json found. Run scrape first.",
             )
 
-        with open(RECONCILIATION_PATH) as f:
-            recon_data = json.load(f)
+        with open(BRAVOS_TRADES_PATH) as f:
+            bravos_data = json.load(f)
 
-        # Parse deltas into proposed trades
-        deltas = recon_data.get("deltas", [])
-        proposed_trades = []
+        new_weights = parse_bravos_weights(bravos_data)
 
-        for delta in deltas:
-            action = delta.get("action")
-            trade_value = delta.get("suggested_trade_value", 0)
+        # Filter out symbols not available on Robinhood
+        skipped = [s for s in new_weights if s in SKIP_SYMBOLS]
+        if skipped:
+            log.info("skipping_non_tradeable_symbols", symbols=skipped)
+            new_weights = {k: v for k, v in new_weights.items() if k not in SKIP_SYMBOLS}
 
-            if action in ("enter", "buy") and trade_value > 0:
-                proposed_trades.append(
-                    ProposedTrade(
-                        symbol=delta["symbol"],
-                        side="buy",
-                        notional=trade_value,
-                        rationale=delta.get("notes", ""),
-                    )
-                )
-            elif action in ("exit", "sell") and trade_value < 0:
-                proposed_trades.append(
-                    ProposedTrade(
-                        symbol=delta["symbol"],
-                        side="sell",
-                        notional=abs(trade_value),
-                        rationale=delta.get("notes", ""),
-                    )
-                )
+        log.info("bravos_weights_parsed", symbol_count=len(new_weights), skipped=skipped)
 
-        summary = recon_data.get("summary", {})
-        total_buy = summary.get("total_buy_value", 0)
-        total_sell = summary.get("total_sell_value", 0)
+        # Step 3: Get sleeve info
+        sleeve_id = None
+        try:
+            async with get_db_context() as db:
+                sleeve = await sleeve_repository.get_by_name(db, "bravos")
+                if sleeve:
+                    sleeve_id = sleeve.id
+        except Exception as e:
+            log.warning("failed_to_get_sleeve_from_db", error=str(e))
+
+        if not sleeve_id:
+            sleeve_id = uuid4()
+            log.warning("using_generated_sleeve_id")
+
+        # Step 4: Run delta reconciliation
+        reconciler = get_delta_reconciler()
+        delta_result = await reconciler.reconcile(
+            sleeve_id=sleeve_id,
+            new_weights=new_weights,
+        )
+
+        if not delta_result.success:
+            return BravosProcessingResult(
+                success=False,
+                new_email=True if email else False,
+                message_id=email.message_id if email else None,
+                error=delta_result.error,
+            )
+
+        # Step 5: Fetch proposal prices (best-effort)
+        trade_symbols = [t.symbol for t in delta_result.trades]
+        proposal_prices: dict[str, float] = {}
+        if trade_symbols:
+            try:
+                from src.brokers.robinhood import get_robinhood_adapter
+
+                broker = get_robinhood_adapter()
+                quotes = await broker.get_quotes(trade_symbols)
+                proposal_prices = {sym: q.last for sym, q in quotes.items() if q.last}
+                log.info("proposal_prices_fetched", count=len(proposal_prices))
+            except Exception as e:
+                log.warning("proposal_prices_fetch_failed", error=str(e))
+
+        # Step 6: Load and persist Bravos entry prices
+        bravos_entry_prices: dict[str, float] = {}
+
+        try:
+            from src.db.repositories.state_repository import state_repository
+            from src.db.session import get_db_context
+
+            # Source 1: Scraper data — persist new entry prices to DB
+            trades_data = bravos_data.get("trades", {})
+            async with get_db_context() as db:
+                for sym, info in trades_data.items():
+                    entry = info.get("entryPrice")
+                    if entry and entry > 0:
+                        await state_repository.upsert_entry_price(
+                            db, sym.upper(), float(entry), "bravos_scrape"
+                        )
+
+                # Source 2: Load all entry prices from DB
+                bravos_entry_prices = await state_repository.get_all_entry_prices(db)
+
+            if bravos_entry_prices:
+                log.info("bravos_entry_prices_loaded", count=len(bravos_entry_prices))
+        except Exception as e:
+            log.warning("bravos_entry_prices_load_failed", error=str(e))
+
+        # Convert delta trades to ProposedTrade format
+        proposed_trades = [
+            ProposedTrade(
+                symbol=t.symbol,
+                side=t.side,
+                notional=float(t.notional),
+                rationale=t.rationale,
+                proposal_price=proposal_prices.get(t.symbol),
+                bravos_entry_price=bravos_entry_prices.get(t.symbol),
+            )
+            for t in delta_result.trades
+        ]
+
+        total_buy = float(delta_result.total_buy)
+        total_sell = float(delta_result.total_sell)
 
         log.info(
-            "reconciliation_parsed",
+            "delta_reconciliation_complete",
             trade_count=len(proposed_trades),
             total_buy=total_buy,
             total_sell=total_sell,
+            changes=[
+                {"symbol": c.symbol, "action": c.action, "delta": float(c.weight_delta)}
+                for c in delta_result.weight_changes
+            ],
         )
 
         # Send approval request if not dry run and there are trades

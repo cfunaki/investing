@@ -113,6 +113,7 @@ class TradeExecutor:
         self,
         approval_id: UUID,
         trades: list[dict[str, Any]],
+        from_queue: bool = False,
     ) -> ExecutionReport:
         """
         Execute a batch of approved trades.
@@ -133,6 +134,7 @@ class TradeExecutor:
 
         report = ExecutionReport(
             approval_id=approval_id,
+            success=False,
             total_trades=len(trades),
             executed=0,
             skipped=0,
@@ -170,6 +172,59 @@ class TradeExecutor:
         report.safety_report = safety_report
 
         if not safety_report.passed:
+            # Check if ALL failures are market_hours (not just one)
+            failures = safety_report.get_failures()
+            market_closed_only = (
+                len(failures) > 0
+                and all(f.check_name == "market_hours" for f in failures)
+                and not self.dry_run
+                and not from_queue  # Don't re-queue when executing from queue
+            )
+
+            if market_closed_only:
+                # Queue for next market open instead of failing
+                try:
+                    from src.db.repositories.state_repository import state_repository
+                    from src.db.session import get_db_context
+                    from src.execution.safety import next_market_open
+
+                    execute_after = next_market_open()
+                    async with get_db_context() as db:
+                        queued = await state_repository.queue_execution(
+                            db=db,
+                            approval_id=approval_id,
+                            trades=trades,
+                            execute_after=execute_after,
+                        )
+
+                    log.info(
+                        "trades_queued_for_market_open",
+                        queued_id=str(queued.id),
+                        execute_after=execute_after.isoformat(),
+                    )
+
+                    # Notify via Telegram
+                    try:
+                        from src.approval.telegram import get_telegram_bot
+                        bot = get_telegram_bot()
+                        symbols = ", ".join(t["symbol"] for t in trades)
+                        await bot.send_notification(
+                            f"*Trades Queued*\n\n"
+                            f"Market is closed. {len(trades)} trade(s) ({symbols}) "
+                            f"queued for execution at {execute_after.strftime('%Y-%m-%d %H:%M UTC')}.\n\n"
+                            f"Use /cancel\\_queued to cancel.",
+                        )
+                    except Exception as e:
+                        log.warning("queued_notification_failed", error=str(e))
+
+                    report.success = True
+                    report.error = "queued_for_market_open"
+                    report.completed_at = datetime.now(timezone.utc)
+                    return report
+                except Exception as e:
+                    log.exception("failed_to_queue_trades", error=str(e))
+                    # Fall through to normal failure handling
+
             log.warning(
                 "safety_checks_failed",
                 failures=[c.check_name for c in safety_report.get_failures()],
@@ -294,6 +349,49 @@ class TradeExecutor:
                 skip_reason="failed_to_acquire_lock",
             )
 
+        # Price deviation check (asymmetric: only skip unfavorable moves)
+        proposal_price = trade.get("proposal_price")
+        if proposal_price:
+            try:
+                current_quote = await self.broker.get_quote(symbol)
+                if current_quote and current_quote.last:
+                    pct_change = (current_quote.last - proposal_price) / proposal_price * 100
+                    from src.config import get_settings
+                    threshold = get_settings().price_deviation_threshold_pct
+
+                    # Buys: skip if price went UP (paying more)
+                    # Sells: skip if price went DOWN (getting less)
+                    unfavorable = (
+                        (side == OrderSide.BUY and pct_change > threshold)
+                        or (side == OrderSide.SELL and pct_change < -threshold)
+                    )
+
+                    log.info(
+                        "price_deviation_check",
+                        proposal_price=proposal_price,
+                        current_price=current_quote.last,
+                        pct_change=round(pct_change, 2),
+                        threshold=threshold,
+                        unfavorable=unfavorable,
+                    )
+
+                    if unfavorable:
+                        await self.idempotency_tracker.mark_failed(execution_key, f"price_deviation:{pct_change:+.1f}%")
+                        return TradeResult(
+                            symbol=symbol,
+                            side=side.value,
+                            success=False,
+                            execution_key=execution_key,
+                            skipped=True,
+                            skip_reason=f"price_deviation:{pct_change:+.1f}%",
+                        )
+                else:
+                    log.warning("price_deviation_check_no_quote", symbol=symbol)
+            except Exception as e:
+                log.warning("price_deviation_check_failed", error=str(e))
+        else:
+            log.info("price_deviation_check_skipped", reason="no_proposal_price")
+
         # Create order request
         request = OrderRequest(
             symbol=symbol,
@@ -384,25 +482,52 @@ class TradeExecutor:
         lines.append(f"Failed: {report.failed}")
         lines.append("")
 
-        if report.results:
-            lines.append("*Results:*")
-            for result in report.results[:10]:  # Limit to 10
-                emoji = "" if result.success else "" if result.skipped else ""
-                status = result.skip_reason if result.skipped else result.status
+        # Group results by outcome
+        executed = [r for r in report.results if r.success]
+        skipped = [r for r in report.results if r.skipped]
+        failed = [r for r in report.results if not r.success and not r.skipped]
 
-                if result.success and result.filled_notional:
-                    lines.append(
-                        f"  {emoji} {result.symbol} {result.side.upper()}: "
-                        f"${result.filled_notional:.2f}"
-                    )
-                else:
-                    lines.append(f"  {emoji} {result.symbol}: {status}")
+        if executed:
+            lines.append("*Executed:*")
+            for r in executed[:10]:
+                price_str = f" @ ${r.filled_price:.2f}" if r.filled_price else ""
+                lines.append(f"  {r.symbol} {r.side.upper()}: ${r.filled_notional or 0:.0f}{price_str}")
+            if len(executed) > 10:
+                lines.append(f"  ... and {len(executed) - 10} more")
 
-            if len(report.results) > 10:
-                lines.append(f"  ... and {len(report.results) - 10} more")
+        if skipped:
+            # Separate price drift skips from other skips
+            price_skips = [r for r in skipped if r.skip_reason and "price_deviation" in r.skip_reason]
+            other_skips = [r for r in skipped if not r.skip_reason or "price_deviation" not in r.skip_reason]
+
+            if price_skips:
+                lines.append("")
+                lines.append(f"*Skipped ({len(price_skips)} price drift):*")
+                for r in price_skips:
+                    deviation = r.skip_reason.split(":")[-1] if r.skip_reason else ""
+                    lines.append(f"  {r.symbol} {r.side.upper()}: {deviation}")
+
+            if other_skips:
+                lines.append("")
+                # Group by reason to avoid repetitive output
+                reasons: dict[str, list[str]] = {}
+                for r in other_skips:
+                    reason = (r.skip_reason or "unknown").replace("_", " ")
+                    reasons.setdefault(reason, []).append(r.symbol)
+                for reason, symbols in reasons.items():
+                    lines.append(f"*Skipped ({len(symbols)} - {reason}):*")
+                    lines.append(f"  {', '.join(symbols)}")
+
+        if failed:
+            lines.append("")
+            lines.append(f"*Failed ({len(failed)}):*")
+            for r in failed[:5]:
+                error_text = (r.error or r.status or "unknown").replace("_", " ")
+                lines.append(f"  {r.symbol}: {error_text}")
 
         if report.error:
-            lines.append(f"\n*Error:* {report.error}")
+            safe_error = report.error.replace("_", " ")
+            lines.append(f"\n*Error:* {safe_error}")
 
         message = "\n".join(lines)
 
@@ -461,6 +586,7 @@ def get_trade_executor() -> TradeExecutor:
 async def execute_approved_trades(
     approval_id: UUID,
     trades: list[dict[str, Any]],
+    from_queue: bool = False,
 ) -> ExecutionReport:
     """
     Convenience function to execute approved trades.
@@ -468,9 +594,10 @@ async def execute_approved_trades(
     Args:
         approval_id: The approval ID
         trades: List of trades to execute
+        from_queue: If True, skip re-queuing on market closed (prevents loops)
 
     Returns:
         ExecutionReport with results
     """
     executor = get_trade_executor()
-    return await executor.execute_approved_trades(approval_id, trades)
+    return await executor.execute_approved_trades(approval_id, trades, from_queue=from_queue)
