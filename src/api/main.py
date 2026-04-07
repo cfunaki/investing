@@ -313,10 +313,15 @@ async def job_poll_email(background_tasks: BackgroundTasks):
     try:
         log.info("starting_email_poll")
 
-        # TODO: Load processed message IDs from database
-        # For now, we process all found emails
-        # In production, query signals table for existing source_event_ids
-        processed_ids: set[str] = set()
+        # Load already-processed message IDs from database
+        from src.signals.bravos_detector import get_bravos_detector
+        try:
+            detector = get_bravos_detector()
+            processed_ids = await detector.get_processed_message_ids()
+            log.info("loaded_processed_ids", count=len(processed_ids))
+        except Exception as e:
+            log.warning("failed_to_load_processed_ids", error=str(e))
+            processed_ids = set()
 
         # Poll for new emails
         emails = await poll_for_bravos_emails(processed_ids=processed_ids)
