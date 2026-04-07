@@ -411,13 +411,7 @@ async def job_poll_email(background_tasks: BackgroundTasks):
 
     except Exception as e:
         log.exception("email_poll_failed", error=str(e))
-        return JobResponse(
-            job="poll_email",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/jobs/reconcile", response_model=JobResponse, tags=["Jobs"])
@@ -491,13 +485,7 @@ async def job_reconcile(sleeve: str = "bravos"):
 
     except Exception as e:
         log.exception("reconcile_failed", error=str(e))
-        return JobResponse(
-            job="reconcile",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/jobs/poll-buffett", response_model=JobResponse, tags=["Jobs"])
@@ -556,13 +544,7 @@ async def job_poll_buffett(force: bool = False):
 
     except Exception as e:
         log.exception("buffett_poll_failed", error=str(e))
-        return JobResponse(
-            job="poll_buffett",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/jobs/expire-approvals", response_model=JobResponse, tags=["Jobs"])
@@ -596,13 +578,7 @@ async def job_expire_approvals():
 
     except Exception as e:
         log.exception("approval_expiration_failed", error=str(e))
-        return JobResponse(
-            job="expire_approvals",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # =============================================================================
@@ -897,13 +873,7 @@ async def job_poll_bravos(force: bool = False, skip_scrape: bool = False):
 
     except Exception as e:
         log.exception("bravos_poll_failed", error=str(e))
-        return JobResponse(
-            job="poll_bravos",
-            status="failed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            error=str(e),
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/jobs/execute-queued", response_model=JobResponse, tags=["Jobs"])
