@@ -330,31 +330,30 @@ class BravosSignalProcessor:
             except Exception as e:
                 log.warning("proposal_prices_fetch_failed", error=str(e))
 
-        # Step 6: Load Bravos entry prices (best-effort)
-        # Check both the scraped data and the persistent entry price cache
+        # Step 6: Load and persist Bravos entry prices
         bravos_entry_prices: dict[str, float] = {}
 
-        # Source 1: Local scraper format has entryPrice in trades dict
-        trades_data = bravos_data.get("trades", {})
-        for sym, info in trades_data.items():
-            entry = info.get("entryPrice")
-            if entry and entry > 0:
-                bravos_entry_prices[sym.upper()] = float(entry)
+        try:
+            from src.db.repositories.state_repository import state_repository
+            from src.db.session import get_db_context
 
-        # Source 2: Persistent entry price cache (survives browser worker overwrites)
-        entry_cache_path = Path("data/state/bravos_entry_prices.json")
-        if entry_cache_path.exists():
-            try:
-                with open(entry_cache_path) as f:
-                    cached = json.load(f)
-                for sym, price in cached.items():
-                    if sym.upper() not in bravos_entry_prices and price and price > 0:
-                        bravos_entry_prices[sym.upper()] = float(price)
-            except Exception:
-                pass
+            # Source 1: Scraper data — persist new entry prices to DB
+            trades_data = bravos_data.get("trades", {})
+            async with get_db_context() as db:
+                for sym, info in trades_data.items():
+                    entry = info.get("entryPrice")
+                    if entry and entry > 0:
+                        await state_repository.upsert_entry_price(
+                            db, sym.upper(), float(entry), "bravos_scrape"
+                        )
 
-        if bravos_entry_prices:
-            log.info("bravos_entry_prices_loaded", count=len(bravos_entry_prices))
+                # Source 2: Load all entry prices from DB
+                bravos_entry_prices = await state_repository.get_all_entry_prices(db)
+
+            if bravos_entry_prices:
+                log.info("bravos_entry_prices_loaded", count=len(bravos_entry_prices))
+        except Exception as e:
+            log.warning("bravos_entry_prices_load_failed", error=str(e))
 
         # Convert delta trades to ProposedTrade format
         proposed_trades = [
