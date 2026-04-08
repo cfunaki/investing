@@ -998,6 +998,8 @@ class TelegramBot:
                     "Robinhood session established and saved to GCS.",
                     parse_mode="Markdown",
                 )
+                # Auto-retry failed trades
+                await self._retry_failed_trades(update)
             else:
                 await update.message.reply_text(
                     "*Login Failed*\n\n"
@@ -1016,6 +1018,56 @@ class TelegramBot:
             self._pending_mfa_future = None
             logger.exception("login_command_failed", error=str(e))
             await update.message.reply_text(f"Login error: {str(e)}")
+
+    async def _retry_failed_trades(self, update: Update) -> None:
+        """Auto-retry approved trades that failed execution (e.g. due to expired RH session)."""
+        try:
+            from src.db.repositories.approval_repository import approval_repository
+            from src.db.session import get_db_context
+            from src.execution.executor import execute_approved_trades
+
+            async with get_db_context() as db:
+                retryable = await approval_repository.get_retryable(db)
+
+            if not retryable:
+                return
+
+            count = len(retryable)
+            trades_desc = ", ".join(
+                f"{len(a.proposed_trades)} trades" for a in retryable
+            )
+            await update.message.reply_text(
+                f"*Retrying {count} failed approval(s)*: {trades_desc}",
+                parse_mode="Markdown",
+            )
+
+            for approval in retryable:
+                try:
+                    report = await execute_approved_trades(
+                        approval_id=approval.id,
+                        trades=approval.proposed_trades,
+                    )
+                    status = "executed" if report.success else "failed"
+                    logger.info(
+                        "retry_execution_completed",
+                        approval_id=str(approval.id),
+                        success=report.success,
+                        executed=report.executed,
+                        failed=report.failed,
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "retry_execution_error",
+                        approval_id=str(approval.id),
+                        error=str(e),
+                    )
+                    await update.message.reply_text(
+                        f"Retry failed for `{approval.approval_code}`: {str(e)}",
+                        parse_mode="Markdown",
+                    )
+
+        except Exception as e:
+            logger.warning("retry_failed_trades_error", error=str(e))
 
     async def _cmd_cancel_queued(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /cancel_queued command - cancel pending queued executions."""

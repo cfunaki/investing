@@ -5,10 +5,10 @@ Repository for Approval database operations.
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import Approval
+from src.db.models import Approval, Execution
 
 
 class ApprovalRepository:
@@ -115,6 +115,32 @@ class ApprovalRepository:
             status="expired",
             responded_at=datetime.now(timezone.utc),
         )
+
+    async def get_retryable(self, db: AsyncSession) -> list[Approval]:
+        """Get approved, non-expired approvals with no successful executions."""
+        now = datetime.now(timezone.utc)
+
+        # Subquery: approval IDs that have at least one successful execution
+        executed_ids = (
+            select(Execution.approval_id)
+            .where(Execution.status.in_(["filled", "submitted", "partial"]))
+            .distinct()
+            .scalar_subquery()
+        )
+
+        stmt = (
+            select(Approval)
+            .where(
+                and_(
+                    Approval.status == "approved",
+                    Approval.expires_at > now,
+                    Approval.id.notin_(executed_ids),
+                )
+            )
+            .order_by(Approval.responded_at.desc())
+        )
+        result = await db.execute(stmt)
+        return list(result.scalars().all())
 
     async def set_telegram_message_id(
         self, db: AsyncSession, approval_id: UUID, message_id: str
