@@ -120,6 +120,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("portfolio", self._cmd_portfolio))
         app.add_handler(CommandHandler("login", self._cmd_login))
         app.add_handler(CommandHandler("cancel_queued", self._cmd_cancel_queued))
+        app.add_handler(CommandHandler("sync", self._cmd_sync))
 
         # Callback query handler for inline buttons
         app.add_handler(CallbackQueryHandler(self._handle_callback))
@@ -564,6 +565,7 @@ class TelegramBot:
             "/holdings - Show current holdings\n"
             "/portfolio - Detailed breakdown by sleeve\n\n"
             "*Other:*\n"
+            "/sync - Re-sync ledger from Robinhood\n"
             "/login - Robinhood login via SMS MFA\n"
             "/help - Show this message",
             parse_mode="Markdown",
@@ -1106,6 +1108,43 @@ class TelegramBot:
         except Exception as e:
             logger.exception("cancel_queued_failed", error=str(e))
             await update.message.reply_text(f"Error: {str(e)}")
+
+    async def _cmd_sync(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /sync command - re-bootstrap sleeve ledger from RH holdings."""
+        user = update.effective_user
+        if not self._is_authorized(user.id):
+            await update.message.reply_text("Unauthorized")
+            return
+
+        await update.message.reply_text("Syncing ledger from Robinhood holdings...")
+
+        try:
+            from src.reconciliation.bootstrap import bootstrap_ledger
+            result = await bootstrap_ledger(force=True)
+
+            if "error" in result:
+                await update.message.reply_text(
+                    f"*Sync Failed*\n{result['error']}",
+                    parse_mode="Markdown",
+                )
+                return
+
+            seeded = result.get("seeded", 0)
+            symbols = result.get("seeded_symbols", [])
+            not_in_rh = result.get("not_in_rh", [])
+
+            msg = f"*Ledger Synced*\n\n"
+            msg += f"Seeded: {seeded} positions\n"
+            if symbols:
+                msg += f"Symbols: {', '.join(symbols)}\n"
+            if not_in_rh:
+                msg += f"Not in RH: {', '.join(not_in_rh)}"
+
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.exception("sync_command_failed", error=str(e))
+            await update.message.reply_text(f"Sync error: {str(e)}")
 
     async def _handle_mfa_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages — captures MFA code if login is in progress."""
