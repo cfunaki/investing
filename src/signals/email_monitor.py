@@ -255,6 +255,8 @@ class GmailMonitor:
         Returns:
             List of new EmailMessage objects
         """
+        # Force fresh connection to avoid stale socket errors
+        self._service = None
         log = logger.bind(query=query, max_results=max_results)
         log.info("checking_for_emails")
 
