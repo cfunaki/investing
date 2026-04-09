@@ -35,6 +35,7 @@ from src.reconciliation.delta_reconciler import (
     get_delta_reconciler,
     parse_bravos_weights,
 )
+from src.db.repositories.signal_repository import signal_repository
 from src.signals.bravos_detector import BravosEmailDetector, get_bravos_detector
 from src.signals.models import (
     ProposedTrade,
@@ -127,6 +128,14 @@ class BravosSignalProcessor:
             email = None
             log.info("processing_forced_or_skip_scrape")
 
+        # Mark as processing immediately (prevents duplicate detection)
+        signal_id = None
+        if email and not dry_run:
+            signal_id = await self.detector.mark_as_processing(
+                message_id=email.message_id,
+                subject=email.subject,
+            )
+
         # Process the email/trigger reconciliation
         try:
             result = await self._process_reconciliation(
@@ -135,8 +144,8 @@ class BravosSignalProcessor:
                 skip_scrape=skip_scrape,
             )
 
-            # Mark as processed if successful and not dry run
-            if result.success and not dry_run and email:
+            # Mark as fully processed
+            if result.success and not dry_run and signal_id:
                 await self.detector.mark_as_processed(
                     message_id=email.message_id,
                     subject=email.subject,
@@ -151,6 +160,49 @@ class BravosSignalProcessor:
 
         except Exception as e:
             log.exception("processing_failed", error=str(e))
+
+            # Handle retry logic for transient errors
+            if signal_id and email and not dry_run:
+                is_transient = isinstance(e, (BrokenPipeError, ConnectionError, TimeoutError, OSError))
+                if is_transient:
+                    try:
+                        async with get_db_context() as db:
+                            retry_count = await signal_repository.increment_retry(db, signal_id)
+
+                        if retry_count >= 3:
+                            # Max retries exceeded — mark as failed, notify
+                            async with get_db_context() as db:
+                                await signal_repository.update_status(
+                                    db, signal_id, status="failed",
+                                    error_message=f"Max retries exceeded: {str(e)}",
+                                )
+                            try:
+                                from src.approval.telegram import get_telegram_bot
+                                bot = get_telegram_bot()
+                                await bot.send_notification(
+                                    f"*Email Processing Failed*\n\n"
+                                    f"Message: {email.subject}\n"
+                                    f"Error: {str(e)}\n"
+                                    f"Retries: {retry_count}/3\n\n"
+                                    f"Use `force=true` to reprocess.",
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            log.info("email_queued_for_retry", retry_count=retry_count)
+                    except Exception as retry_err:
+                        log.warning("retry_tracking_failed", error=str(retry_err))
+                else:
+                    # Persistent error — mark as failed immediately
+                    try:
+                        async with get_db_context() as db:
+                            await signal_repository.update_status(
+                                db, signal_id, status="failed",
+                                error_message=str(e),
+                            )
+                    except Exception:
+                        pass
+
             return BravosProcessingResult(
                 success=False,
                 new_email=True if email else False,

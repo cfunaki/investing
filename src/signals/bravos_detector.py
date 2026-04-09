@@ -104,6 +104,49 @@ class BravosEmailDetector:
             logger.warning("failed_to_get_processed_ids", error=str(e))
             return set()
 
+    async def mark_as_processing(
+        self,
+        message_id: str,
+        subject: str | None = None,
+    ) -> UUID | None:
+        """
+        Mark an email as 'processing' immediately on detection.
+        Returns the signal ID for later status updates.
+        """
+        sleeve_id = await self._get_sleeve_id()
+        if not sleeve_id:
+            logger.error("cannot_mark_processing_no_sleeve_id")
+            return None
+
+        try:
+            async with get_db_context() as db:
+                existing = await signal_repository.get_by_source_event_id(
+                    db, sleeve_id, message_id
+                )
+                if existing:
+                    # Already exists — update to processing if it's a retry
+                    if existing.status == "retry":
+                        await signal_repository.update_status(
+                            db, existing.id, status="processing"
+                        )
+                    return existing.id
+                else:
+                    signal = await signal_repository.create(
+                        db=db,
+                        sleeve_id=sleeve_id,
+                        source_event_id=message_id,
+                        event_type="email_detected",
+                        detected_at=datetime.now(timezone.utc),
+                        raw_payload={"subject": subject},
+                        status="processing",
+                    )
+                    logger.info("marked_email_as_processing", message_id=message_id)
+                    return signal.id
+
+        except Exception as e:
+            logger.exception("failed_to_mark_as_processing", error=str(e))
+            return None
+
     async def mark_as_processed(
         self,
         message_id: str,

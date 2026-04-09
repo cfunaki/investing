@@ -113,6 +113,24 @@ class SignalRepository:
         result = await db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def increment_retry(
+        self,
+        db: AsyncSession,
+        signal_id: UUID,
+    ) -> int:
+        """Increment retry count and return new count."""
+        stmt = (
+            update(Signal)
+            .where(Signal.id == signal_id)
+            .values(
+                retry_count=Signal.retry_count + 1,
+                status="retry",
+            )
+            .returning(Signal.retry_count)
+        )
+        result = await db.execute(stmt)
+        return result.scalar_one()
+
     async def get_recent(
         self, db: AsyncSession, sleeve_id: UUID | None = None, limit: int = 20
     ) -> list[Signal]:
