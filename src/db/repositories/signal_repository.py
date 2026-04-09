@@ -68,7 +68,7 @@ class SignalRepository:
         """Get all processed source event IDs for a sleeve."""
         stmt = select(Signal.source_event_id).where(
             Signal.sleeve_id == sleeve_id,
-            Signal.status.in_(["processed", "processing", "skipped"]),
+            Signal.status.in_(["processed", "processing", "skipped", "failed"]),
         )
         result = await db.execute(stmt)
         return {row[0] for row in result.all()}

@@ -127,7 +127,11 @@ class DeltaReconciler:
             trades = self._generate_trades(weight_changes, current_positions)
 
             total_buy = sum(t.notional for t in trades if t.side == "buy")
-            total_sell = sum(t.notional for t in trades if t.side == "sell")
+            # Sell notional is 0 (sells use quantity), estimate from weight delta
+            total_sell = sum(
+                abs(t.weight_delta) * self.unit_size
+                for t in trades if t.side == "sell"
+            )
 
             log.info(
                 "delta_reconcile_complete",
