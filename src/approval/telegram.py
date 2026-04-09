@@ -1131,12 +1131,15 @@ class TelegramBot:
 
             seeded = result.get("seeded", 0)
             symbols = result.get("seeded_symbols", [])
+            already_tracked = result.get("already_tracked", [])
             not_in_rh = result.get("not_in_rh", [])
 
             msg = f"*Ledger Synced*\n\n"
-            msg += f"Seeded: {seeded} positions\n"
+            msg += f"Seeded: {seeded} new positions\n"
             if symbols:
-                msg += f"Symbols: {', '.join(symbols)}\n"
+                msg += f"New: {', '.join(symbols)}\n"
+            if already_tracked:
+                msg += f"Already tracked: {', '.join(already_tracked)}\n"
             if not_in_rh:
                 msg += f"Not in RH: {', '.join(not_in_rh)}"
 

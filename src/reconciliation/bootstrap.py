@@ -24,11 +24,16 @@ async def bootstrap_ledger(force: bool = False) -> dict:
     """
     Bootstrap sleeve_positions from RH holdings × Bravos targets.
 
+    Only seeds NEW symbols — never overwrites existing ledger positions,
+    since those are maintained by trade execution and may not reflect
+    total RH holdings (e.g., user holds same stock outside Bravos).
+
     Args:
-        force: If False, only runs when ledger is empty. If True, always runs.
+        force: If False, skips entirely when ledger has any positions.
+               If True, runs but still only seeds new symbols.
 
     Returns:
-        Dict with bootstrap results (seeded count, skipped, errors).
+        Dict with bootstrap results (seeded count, already tracked, errors).
     """
     # Get bravos sleeve
     async with get_db_context() as db:
@@ -76,12 +81,24 @@ async def bootstrap_ledger(force: bool = False) -> dict:
 
     logger.info("bootstrap_rh_positions", extra={"count": len(rh_positions)})
 
-    # Cross-reference and seed
+    # Get existing ledger positions (to avoid overwriting trade-tracked data)
+    async with get_db_context() as db:
+        existing_positions = await sleeve_position_repository.get_position_map(db, sleeve_id)
+
+    # Cross-reference and seed — only NEW symbols, never overwrite existing
     seeded = []
+    already_tracked = []
     not_in_rh = []
 
     async with get_db_context() as db:
         for symbol in bravos_symbols:
+            # Skip symbols already in the ledger — their shares are
+            # maintained by trade execution and may differ from total RH
+            # holdings (e.g., if the user also holds the stock outside Bravos)
+            if symbol in existing_positions:
+                already_tracked.append(symbol)
+                continue
+
             rh_pos = rh_by_symbol.get(symbol)
             if rh_pos and rh_pos.quantity > 0:
                 weight = bravos_weights.get(symbol, Decimal(0))
@@ -108,6 +125,7 @@ async def bootstrap_ledger(force: bool = False) -> dict:
     result = {
         "seeded": len(seeded),
         "seeded_symbols": sorted(seeded),
+        "already_tracked": sorted(already_tracked),
         "not_in_rh": sorted(not_in_rh),
     }
     logger.info("bootstrap_complete", extra=result)
