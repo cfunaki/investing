@@ -51,9 +51,14 @@ async def run_migrations() -> None:
 
             # Execute each statement separately (sqlalchemy text() doesn't support multi-statement)
             for statement in sql.split(";"):
-                statement = statement.strip()
-                if statement and not statement.startswith("--"):
-                    await db.execute(text(statement))
+                # Strip comments and whitespace
+                lines = [
+                    line for line in statement.strip().splitlines()
+                    if line.strip() and not line.strip().startswith("--")
+                ]
+                cleaned = "\n".join(lines).strip()
+                if cleaned:
+                    await db.execute(text(cleaned))
 
             await db.execute(
                 text("INSERT INTO schema_migrations (filename) VALUES (:f)"),

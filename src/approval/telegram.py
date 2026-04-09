@@ -1123,9 +1123,12 @@ class TelegramBot:
             result = await bootstrap_ledger(force=True)
 
             if "error" in result:
+                await update.message.reply_text(f"Sync Failed\n{result['error']}")
+                return
+
+            if result.get("skipped"):
                 await update.message.reply_text(
-                    f"*Sync Failed*\n{result['error']}",
-                    parse_mode="Markdown",
+                    f"Ledger already has {result.get('existing_positions', 0)} positions (skipped)"
                 )
                 return
 
@@ -1134,16 +1137,15 @@ class TelegramBot:
             already_tracked = result.get("already_tracked", [])
             not_in_rh = result.get("not_in_rh", [])
 
-            msg = f"*Ledger Synced*\n\n"
-            msg += f"Seeded: {seeded} new positions\n"
+            lines = [f"Ledger Synced: {seeded} new positions"]
             if symbols:
-                msg += f"New: {', '.join(symbols)}\n"
+                lines.append(f"New: {', '.join(symbols)}")
             if already_tracked:
-                msg += f"Already tracked: {', '.join(already_tracked)}\n"
+                lines.append(f"Already tracked: {', '.join(already_tracked)}")
             if not_in_rh:
-                msg += f"Not in RH: {', '.join(not_in_rh)}"
+                lines.append(f"Not in RH: {', '.join(not_in_rh)}")
 
-            await update.message.reply_text(msg, parse_mode="Markdown")
+            await update.message.reply_text("\n".join(lines))
 
         except Exception as e:
             logger.exception("sync_command_failed", error=str(e))
