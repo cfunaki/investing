@@ -116,6 +116,7 @@ class RobinhoodAdapter(BrokerAdapter):
         self._password = settings.rh_password
         self._totp_secret = settings.rh_totp_secret
         self._connected = False
+        self._login_failed = False  # Circuit breaker: True after a failed login
 
     @property
     def name(self) -> str:
@@ -128,6 +129,13 @@ class RobinhoodAdapter(BrokerAdapter):
     async def connect(self) -> bool:
         """Authenticate with Robinhood."""
         log = logger.bind(broker="robinhood")
+
+        # Circuit breaker: don't retry login after a failure.
+        # Only /login (connect_with_telegram_mfa) resets this.
+        if self._login_failed:
+            log.debug("connect_skipped_circuit_breaker_open")
+            return False
+
         log.info("connecting_to_robinhood")
 
         try:
@@ -160,15 +168,18 @@ class RobinhoodAdapter(BrokerAdapter):
 
             if result:
                 self._connected = True
+                self._login_failed = False
                 log.info("robinhood_connected")
                 return True
             else:
                 log.error("robinhood_login_failed")
+                self._login_failed = True
                 await self._notify_session_expired()
                 return False
 
         except Exception as e:
             log.exception("robinhood_connection_error", error=str(e))
+            self._login_failed = True
             await self._notify_session_expired()
             return False
 
@@ -243,6 +254,7 @@ class RobinhoodAdapter(BrokerAdapter):
 
             if result:
                 self._connected = True
+                self._login_failed = False  # Reset circuit breaker
                 log.info("telegram_mfa_login_success")
 
                 # Upload session to GCS for persistence
