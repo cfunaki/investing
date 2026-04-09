@@ -361,6 +361,7 @@ class BravosSignalProcessor:
                 symbol=t.symbol,
                 side=t.side,
                 notional=float(t.notional),
+                quantity=float(t.quantity) if t.quantity else None,
                 rationale=t.rationale,
                 proposal_price=proposal_prices.get(t.symbol),
                 bravos_entry_price=bravos_entry_prices.get(t.symbol),
