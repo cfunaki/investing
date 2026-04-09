@@ -91,6 +91,14 @@ async def lifespan(app: FastAPI):
 
         from src.db.migrator import run_migrations
         await run_migrations()
+
+        # Bootstrap ledger if empty (first-time setup)
+        try:
+            from src.reconciliation.bootstrap import bootstrap_ledger
+            result = await bootstrap_ledger(force=False)
+            logger.info(f"Ledger bootstrap: {result}")
+        except Exception as e:
+            logger.warning(f"Ledger bootstrap failed (non-fatal): {e}")
     except Exception as e:
         logger.error(f"Database startup failed: {e}")
 

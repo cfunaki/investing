@@ -22,7 +22,6 @@ import structlog
 
 from src.approval.telegram import ApprovalRequest, TelegramBot, generate_approval_code, get_telegram_bot
 from src.config import get_settings
-from src.db.models import Reconciliation
 from src.db.repositories.approval_repository import approval_repository
 from src.db.repositories.reconciliation_repository import reconciliation_repository
 from src.db.repositories.sleeve_repository import sleeve_repository
@@ -674,13 +673,11 @@ class ApprovalWorkflow:
     async def expire_pending_approvals(self) -> int:
         """
         Expire any pending approvals that have passed their expiration time.
-        Auto-retriggers a new approval with the same trades.
 
         Returns:
             Number of approvals expired
         """
         expired_count = 0
-        to_retrigger: list[tuple[ApprovalRecord, str | None]] = []  # (record, sleeve_name)
         now = datetime.now(timezone.utc)
 
         # Expire in-memory approvals
@@ -698,12 +695,10 @@ class ApprovalWorkflow:
                 # Update Telegram message
                 await self.bot.update_approval_message(
                     code,
-                    f"*Approval Expired — resending...*\n"
+                    f"*Approval Expired*\n"
                     f"Code: `{code}`\n"
                     f"Expired at: {now.strftime('%Y-%m-%d %H:%M UTC')}",
                 )
-
-                to_retrigger.append((record, None))
 
         # Expire database approvals
         try:
@@ -711,7 +706,6 @@ class ApprovalWorkflow:
                 db_expired = await approval_repository.get_expired(db)
                 for db_approval in db_expired:
                     await approval_repository.mark_expired(db, db_approval.id)
-                    # Only count if not already counted from in-memory
                     if db_approval.approval_code not in self._approvals:
                         expired_count += 1
                         logger.info(
@@ -719,116 +713,10 @@ class ApprovalWorkflow:
                             approval_code=db_approval.approval_code,
                             approval_id=str(db_approval.id),
                         )
-                        # Resolve sleeve_id from reconciliation
-                        recon = await db.get(Reconciliation, db_approval.reconciliation_id)
-                        db_sleeve_id = recon.sleeve_id if recon else uuid4()
-
-                        retrigger_record = ApprovalRecord(
-                            id=db_approval.id,
-                            reconciliation_id=db_approval.reconciliation_id,
-                            sleeve_id=db_sleeve_id,
-                            approval_code=db_approval.approval_code,
-                            proposed_trades=db_approval.proposed_trades,
-                            total_notional=sum(
-                                abs(t.get("notional", 0)) for t in db_approval.proposed_trades
-                            ),
-                        )
-                        to_retrigger.append((retrigger_record, None))
         except Exception as e:
             logger.warning("failed_to_expire_db_approvals", error=str(e))
 
-        # Auto-retrigger expired approvals
-        for record, _ in to_retrigger:
-            try:
-                await self._retrigger_approval(record)
-            except Exception as e:
-                logger.warning(
-                    "auto_retrigger_failed",
-                    approval_id=str(record.id),
-                    error=str(e),
-                )
-
         return expired_count
-
-    async def _retrigger_approval(self, expired_record: ApprovalRecord) -> None:
-        """Create a new approval from an expired one with the same trades."""
-        settings = get_settings()
-        new_code = generate_approval_code()
-        requested_at = datetime.now(timezone.utc)
-        expires_at = requested_at + timedelta(minutes=settings.approval_expiry_minutes)
-
-        # Resolve sleeve name from sleeve_id
-        sleeve_name = "unknown"
-        sleeve_id = expired_record.sleeve_id
-        try:
-            async with get_db_context() as db:
-                sleeve = await sleeve_repository.get_by_id(db, expired_record.sleeve_id)
-                if sleeve:
-                    sleeve_name = sleeve.name
-                    sleeve_id = sleeve.id
-
-                # Create new approval in DB linked to same reconciliation
-                new_db_approval = await approval_repository.create(
-                    db=db,
-                    reconciliation_id=expired_record.reconciliation_id,
-                    approval_code=new_code,
-                    proposed_trades=expired_record.proposed_trades,
-                    requested_at=requested_at,
-                    expires_at=expires_at,
-                )
-                new_approval_id = new_db_approval.id
-
-        except Exception as e:
-            logger.warning("retrigger_db_failed", error=str(e))
-            new_approval_id = uuid4()
-
-        # Create in-memory record
-        new_record = ApprovalRecord(
-            id=new_approval_id,
-            reconciliation_id=expired_record.reconciliation_id,
-            sleeve_id=sleeve_id,
-            approval_code=new_code,
-            proposed_trades=expired_record.proposed_trades,
-            total_notional=expired_record.total_notional,
-            expires_at=expires_at,
-        )
-
-        # Send to Telegram
-        request = ApprovalRequest(
-            approval_id=new_record.id,
-            reconciliation_id=expired_record.reconciliation_id,
-            sleeve_name=sleeve_name,
-            proposed_trades=new_record.proposed_trades,
-            total_notional=new_record.total_notional,
-            approval_code=new_code,
-            expires_at=expires_at,
-        )
-
-        message_id = await self.bot.send_approval_request(request)
-
-        if message_id:
-            new_record.telegram_message_id = message_id
-            self._approvals[new_code] = new_record
-            self._approvals_by_id[new_record.id] = new_record
-
-            # Update message ID in DB
-            try:
-                async with get_db_context() as db:
-                    await approval_repository.set_telegram_message_id(
-                        db, new_approval_id, str(message_id)
-                    )
-            except Exception:
-                pass
-
-            logger.info(
-                "auto_retriggered_expired_approval",
-                old_code=expired_record.approval_code,
-                new_code=new_code,
-                sleeve=sleeve_name,
-                expires_at=expires_at.isoformat(),
-            )
-        else:
-            logger.error("auto_retrigger_telegram_failed", new_code=new_code)
 
     def get_pending_approvals(self) -> list[ApprovalRecord]:
         """Get all pending approval records from in-memory cache."""

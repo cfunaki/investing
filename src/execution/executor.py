@@ -305,6 +305,7 @@ class TradeExecutor:
         side_str = trade.get("side", "buy").lower()
         side = OrderSide.BUY if side_str == "buy" else OrderSide.SELL
         notional = abs(trade.get("notional", 0))
+        quantity = trade.get("quantity")
 
         log = logger.bind(
             symbol=symbol,
@@ -393,13 +394,22 @@ class TradeExecutor:
             log.info("price_deviation_check_skipped", reason="no_proposal_price")
 
         # Create order request
-        request = OrderRequest(
-            symbol=symbol,
-            side=side,
-            notional=notional,
-            order_type=OrderType.MARKET,
-            client_order_id=execution_key,
-        )
+        if quantity:
+            request = OrderRequest(
+                symbol=symbol,
+                side=side,
+                quantity=float(quantity),
+                order_type=OrderType.MARKET,
+                client_order_id=execution_key,
+            )
+        else:
+            request = OrderRequest(
+                symbol=symbol,
+                side=side,
+                notional=notional,
+                order_type=OrderType.MARKET,
+                client_order_id=execution_key,
+            )
 
         log.info("placing_order")
 

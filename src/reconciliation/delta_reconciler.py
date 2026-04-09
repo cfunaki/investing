@@ -46,10 +46,11 @@ class DeltaTrade:
 
     symbol: str
     side: str  # 'buy' or 'sell'
-    notional: Decimal  # Dollar amount to trade
+    notional: Decimal  # Dollar amount (for buys)
     weight_delta: Decimal  # Weight units changed
     target_weight: Decimal  # Final weight after this trade
     rationale: str
+    quantity: Decimal | None = None  # Share quantity (for sells)
 
 
 @dataclass
@@ -123,10 +124,14 @@ class DeltaReconciler:
             )
 
             # Generate trades for changes
-            trades = self._generate_trades(weight_changes)
+            trades = self._generate_trades(weight_changes, current_positions)
 
             total_buy = sum(t.notional for t in trades if t.side == "buy")
-            total_sell = sum(t.notional for t in trades if t.side == "sell")
+            # Sell notional is 0 (sells use quantity), estimate from weight delta
+            total_sell = sum(
+                abs(t.weight_delta) * self.unit_size
+                for t in trades if t.side == "sell"
+            )
 
             log.info(
                 "delta_reconcile_complete",
@@ -195,8 +200,16 @@ class DeltaReconciler:
 
         return changes
 
-    def _generate_trades(self, weight_changes: list[WeightChange]) -> list[DeltaTrade]:
-        """Generate trades from weight changes."""
+    def _generate_trades(
+        self,
+        weight_changes: list[WeightChange],
+        current_positions: dict[str, SleevePosition],
+    ) -> list[DeltaTrade]:
+        """Generate trades from weight changes.
+
+        Buys use notional (weight_delta * unit_size).
+        Sells use actual share quantities from the ledger.
+        """
         trades = []
 
         for change in weight_changes:
@@ -218,14 +231,17 @@ class DeltaReconciler:
                     )
                 )
             elif change.action == "exit":
+                position = current_positions.get(change.symbol)
+                shares = position.shares if position else Decimal(0)
                 trades.append(
                     DeltaTrade(
                         symbol=change.symbol,
                         side="sell",
-                        notional=notional,  # This will be overridden to sell all
+                        notional=Decimal(0),
                         weight_delta=-change.old_weight,
                         target_weight=Decimal(0),
-                        rationale=f"Exit position: was weight {change.old_weight}",
+                        rationale=f"Exit position: sell all {shares} shares",
+                        quantity=shares,
                     )
                 )
             elif change.action == "increase":
@@ -240,14 +256,21 @@ class DeltaReconciler:
                     )
                 )
             elif change.action == "decrease":
+                position = current_positions.get(change.symbol)
+                if position and position.shares > 0 and change.old_weight > 0:
+                    sell_fraction = delta / change.old_weight
+                    shares_to_sell = (position.shares * sell_fraction).quantize(Decimal("0.000001"))
+                else:
+                    shares_to_sell = Decimal(0)
                 trades.append(
                     DeltaTrade(
                         symbol=change.symbol,
                         side="sell",
-                        notional=notional,
+                        notional=Decimal(0),
                         weight_delta=change.weight_delta,
                         target_weight=change.new_weight,
-                        rationale=f"Decrease weight: {change.old_weight} → {change.new_weight}",
+                        rationale=f"Decrease weight: {change.old_weight} → {change.new_weight}, sell {shares_to_sell} shares",
+                        quantity=shares_to_sell,
                     )
                 )
 
