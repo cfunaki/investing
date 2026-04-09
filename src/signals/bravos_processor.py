@@ -387,7 +387,6 @@ class BravosSignalProcessor:
 
         try:
             from src.db.repositories.state_repository import state_repository
-            from src.db.session import get_db_context
 
             # Source 1: Scraper data — persist new entry prices to DB
             trades_data = bravos_data.get("trades", {})
