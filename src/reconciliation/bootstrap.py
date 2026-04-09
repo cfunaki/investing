@@ -10,6 +10,8 @@ import logging
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
+
 from src.brokers.robinhood import get_robinhood_adapter
 from src.db.repositories.sleeve_position_repository import sleeve_position_repository
 from src.db.repositories.sleeve_repository import sleeve_repository
@@ -51,17 +53,34 @@ async def bootstrap_ledger(force: bool = False) -> dict:
                 logger.info("bootstrap_skipped_ledger_has_positions", extra={"count": len(positions)})
                 return {"skipped": True, "existing_positions": len(positions)}
 
-    # Get Bravos target symbols
+    # Get Bravos target symbols — scrape if no cached data
+    if not BRAVOS_TRADES_PATH.exists():
+        logger.info("bootstrap_scraping_bravos")
+        try:
+            from src.config import get_settings
+            settings = get_settings()
+            url = settings.browser_worker_url
+            if url:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(f"{url}/scrape/bravos", json={})
+                if resp.status_code == 200:
+                    BRAVOS_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with open(BRAVOS_TRADES_PATH, "w") as f:
+                        json.dump(resp.json(), f, indent=2)
+                    logger.info("bootstrap_bravos_scraped")
+                else:
+                    return {"error": f"Bravos scrape failed: HTTP {resp.status_code}"}
+            else:
+                return {"error": "No browser worker URL configured and no cached bravos data"}
+        except Exception as e:
+            return {"error": f"Bravos scrape failed: {e}"}
+
     bravos_symbols = set()
     bravos_weights = {}
-    if BRAVOS_TRADES_PATH.exists():
-        with open(BRAVOS_TRADES_PATH) as f:
-            bravos_data = json.load(f)
-        bravos_weights = parse_bravos_weights(bravos_data)
-        bravos_symbols = set(bravos_weights.keys())
-    else:
-        logger.warning("bootstrap_no_bravos_data", extra={"path": str(BRAVOS_TRADES_PATH)})
-        return {"error": "No bravos_trades.json found. Run a scrape first."}
+    with open(BRAVOS_TRADES_PATH) as f:
+        bravos_data = json.load(f)
+    bravos_weights = parse_bravos_weights(bravos_data)
+    bravos_symbols = set(bravos_weights.keys())
 
     if not bravos_symbols:
         return {"error": "No Bravos symbols found"}
