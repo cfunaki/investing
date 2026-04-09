@@ -173,6 +173,9 @@ class Signal(Base):
     )  # 'pending', 'processing', 'processed', 'failed', 'skipped'
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[Optional[str]] = mapped_column(Text)
+    retry_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
