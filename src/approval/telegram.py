@@ -161,7 +161,12 @@ class TelegramBot:
         sells = [t for t in trades if t.get("side", "").lower() == "sell"]
 
         total_buy = sum(abs(t.get("notional", 0)) for t in buys)
-        total_sell = sum(abs(t.get("notional", 0)) for t in sells)
+        # Sells use quantity (notional=0), estimate value from price × quantity
+        total_sell = sum(
+            abs(t.get("notional", 0))
+            or (t.get("proposal_price", 0) or 0) * (t.get("quantity", 0) or 0)
+            for t in sells
+        )
         net = total_buy - total_sell
 
         lines = [
@@ -187,8 +192,17 @@ class TelegramBot:
             lines.append(f"*Sells ({len(sells)}):*")
             for trade in sells[:10]:
                 symbol = trade.get("symbol", "???")
+                qty = trade.get("quantity")
                 notional = abs(trade.get("notional", 0))
-                line = f"  {symbol}  -${notional:,.0f}"
+                if qty and notional == 0:
+                    # Sells use quantity, show shares and estimated value
+                    price = trade.get("proposal_price", 0) or 0
+                    est_value = price * qty
+                    line = f"  {symbol}  {qty:.2f} shs"
+                    if est_value > 0:
+                        line += f" (~${est_value:,.0f})"
+                else:
+                    line = f"  {symbol}  -${notional:,.0f}"
                 line += self._format_price_context(trade)
                 lines.append(line)
             if len(sells) > 10:
@@ -197,7 +211,7 @@ class TelegramBot:
         lines.extend([
             "",
             f"*Total Buys:* +${total_buy:,.0f}",
-            f"*Total Sells:* -${total_sell:,.0f}",
+            f"*Total Sells:* -${total_sell:,.0f}" if total_sell > 0 else f"*Total Sells:* -$0",
             f"*Net:* {'+'if net >= 0 else '-'}${abs(net):,.0f}",
             "",
             f"*Expires:* {expires_at.strftime('%H:%M UTC')}",
