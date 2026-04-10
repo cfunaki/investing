@@ -244,6 +244,113 @@ class RobinhoodAdapter(BrokerAdapter):
         try:
             builtins.input = patched_input
 
+            # Monkey-patch robin_stocks' broken _validate_sherrif_id to handle
+            # None API responses and device-prompt challenges gracefully.
+            import robin_stocks.robinhood.authentication as rh_auth
+            original_validate = rh_auth._validate_sherrif_id
+
+            def _patched_validate(device_token, workflow_id):
+                """Patched version that handles None responses from RH API."""
+                from robin_stocks.robinhood.helper import request_post, request_get
+                import time
+
+                pathfinder_url = "https://api.robinhood.com/pathfinder/user_machine/"
+                machine_payload = {
+                    'device_id': device_token,
+                    'flow': 'suv',
+                    'input': {'workflow_id': workflow_id},
+                }
+                machine_data = request_post(
+                    url=pathfinder_url, payload=machine_payload, json=True,
+                )
+                if not machine_data or "id" not in machine_data:
+                    log.warning("sherrif_id_missing_from_response")
+                    raise Exception("No verification ID returned")
+
+                machine_id = machine_data["id"]
+                inquiries_url = (
+                    f"https://api.robinhood.com/pathfinder/inquiries/"
+                    f"{machine_id}/user_view/"
+                )
+
+                start_time = time.time()
+                while time.time() - start_time < 120:
+                    time.sleep(5)
+                    resp = request_get(inquiries_url)
+                    if not resp:
+                        continue
+
+                    ctx = resp.get("context", {})
+                    challenge = ctx.get("sheriff_challenge")
+                    if not challenge:
+                        continue
+
+                    c_type = challenge.get("type")
+                    c_status = challenge.get("status")
+                    c_id = challenge.get("id")
+
+                    if c_status == "validated":
+                        log.info("challenge_validated")
+                        break
+
+                    if c_type == "prompt":
+                        # Device approval — poll with None-safety
+                        prompt_url = (
+                            f"https://api.robinhood.com/push/{c_id}/"
+                            f"get_prompts_status/"
+                        )
+                        log.info("waiting_for_device_approval")
+                        while time.time() - start_time < 120:
+                            time.sleep(5)
+                            status = request_get(url=prompt_url)
+                            if status and status.get(
+                                "challenge_status"
+                            ) == "validated":
+                                break
+                        break
+
+                    if c_type in ["sms", "email"] and c_status == "issued":
+                        code = builtins.input(
+                            f"Enter the {c_type} verification code: "
+                        )
+                        challenge_url = (
+                            f"https://api.robinhood.com/challenge/"
+                            f"{c_id}/respond/"
+                        )
+                        cr = request_post(
+                            url=challenge_url,
+                            payload={"response": code},
+                        )
+                        if cr and cr.get("status") == "validated":
+                            break
+
+                # Poll workflow status
+                for _ in range(5):
+                    try:
+                        payload = {
+                            "sequence": 0,
+                            "user_input": {"status": "continue"},
+                        }
+                        fr = request_post(
+                            url=inquiries_url, payload=payload, json=True,
+                        )
+                        if fr:
+                            tc = fr.get("type_context", {})
+                            if tc.get("result") == "workflow_status_approved":
+                                log.info("workflow_approved")
+                                return
+                            wf = fr.get("verification_workflow", {})
+                            if wf.get(
+                                "workflow_status"
+                            ) == "workflow_status_approved":
+                                log.info("workflow_approved")
+                                return
+                    except Exception:
+                        pass
+                    time.sleep(5)
+
+            rh_auth._validate_sherrif_id = _patched_validate
+
             # Run rh.login() in a thread (it's synchronous)
             result = await _run_sync(
                 rh.login,
@@ -270,6 +377,11 @@ class RobinhoodAdapter(BrokerAdapter):
             return False
         finally:
             builtins.input = original_input
+            # Restore original robin_stocks function
+            try:
+                rh_auth._validate_sherrif_id = original_validate
+            except Exception:
+                pass
 
     async def disconnect(self) -> None:
         """Logout from Robinhood."""
