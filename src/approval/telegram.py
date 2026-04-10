@@ -195,12 +195,10 @@ class TelegramBot:
                 qty = trade.get("quantity")
                 notional = abs(trade.get("notional", 0))
                 if qty and notional == 0:
-                    # Sells use quantity, show shares and estimated value
+                    # Sells use quantity; display dollar value from price × qty
                     price = trade.get("proposal_price", 0) or 0
                     est_value = price * qty
-                    line = f"  {symbol}  {qty:.2f} shs"
-                    if est_value > 0:
-                        line += f" (~${est_value:,.0f})"
+                    line = f"  {symbol}  -${est_value:,.0f}"
                 else:
                     line = f"  {symbol}  -${notional:,.0f}"
                 line += self._format_price_context(trade)

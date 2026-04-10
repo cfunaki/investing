@@ -280,6 +280,66 @@ class BravosSignalProcessor:
         except FileNotFoundError:
             return {"success": False, "error": "npx not found - use browser worker in production"}
 
+    async def _scrape_bravos_entry_prices(
+        self, log, symbols: list[str]
+    ) -> dict[str, float]:
+        """
+        Scrape Bravos entry prices for specific symbols via the browser worker.
+
+        Hits /scrape/bravos-trades which runs scrape-bravos-trades.ts filtered
+        to the requested symbols only. Slow (visits each symbol's journal pages),
+        but only runs when we have uncached symbols — entry prices are immutable
+        and cached in Postgres permanently after first capture.
+
+        Returns:
+            dict of {symbol: entry_price} for any trades successfully scraped.
+            Empty dict on failure; caller should continue without % context.
+        """
+        from src.config import get_settings
+
+        if not symbols:
+            return {}
+
+        settings = get_settings()
+        browser_worker_url = settings.browser_worker_url
+
+        if not browser_worker_url or browser_worker_url.startswith("http://localhost"):
+            log.warning("entry_price_scrape_skipped_no_browser_worker")
+            return {}
+
+        log.info("scraping_bravos_entry_prices", url=browser_worker_url, symbols=symbols)
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                response = await client.post(
+                    f"{browser_worker_url}/scrape/bravos-trades",
+                    json={"symbols": symbols},
+                )
+
+                if response.status_code != 200:
+                    log.error(
+                        "entry_price_scrape_failed",
+                        status=response.status_code,
+                        body=response.text[:200],
+                    )
+                    return {}
+
+                data = response.json()
+                trades = data.get("trades", {}) or {}
+                result: dict[str, float] = {}
+                for sym, info in trades.items():
+                    entry = info.get("entryPrice") if isinstance(info, dict) else None
+                    if entry and entry > 0:
+                        result[sym.upper()] = float(entry)
+
+                log.info("entry_price_scrape_complete", count=len(result))
+                return result
+        except httpx.TimeoutException:
+            log.error("entry_price_scrape_timeout")
+            return {}
+        except Exception as e:
+            log.error("entry_price_scrape_error", error=str(e))
+            return {}
+
     async def _process_reconciliation(
         self,
         email,
@@ -382,24 +442,34 @@ class BravosSignalProcessor:
             except Exception as e:
                 log.warning("proposal_prices_fetch_failed", error=str(e))
 
-        # Step 6: Load and persist Bravos entry prices
+        # Step 6: Load Bravos entry prices — these are the prices Bravos
+        # published as their entry for each trade. Cached in DB permanently
+        # (entry prices don't change once a trade is entered).
         bravos_entry_prices: dict[str, float] = {}
-
         try:
             from src.db.repositories.state_repository import state_repository
 
-            # Source 1: Scraper data — persist new entry prices to DB
-            trades_data = bravos_data.get("trades", {})
             async with get_db_context() as db:
-                for sym, info in trades_data.items():
-                    entry = info.get("entryPrice")
-                    if entry and entry > 0:
-                        await state_repository.upsert_entry_price(
-                            db, sym.upper(), float(entry), "bravos_scrape"
-                        )
-
-                # Source 2: Load all entry prices from DB
+                # Load what we already have cached
                 bravos_entry_prices = await state_repository.get_all_entry_prices(db)
+
+                # Find active symbols we don't yet have entry prices for
+                needed_symbols = [
+                    s.upper() for s in new_weights.keys() if s.upper() not in bravos_entry_prices
+                ]
+
+            # If any are missing, trigger a one-shot scrape via browser worker
+            # — only for the specific missing symbols, not every active position
+            if needed_symbols:
+                log.info("entry_prices_missing", symbols=needed_symbols)
+                scraped = await self._scrape_bravos_entry_prices(log, needed_symbols)
+                if scraped:
+                    async with get_db_context() as db:
+                        for sym, price in scraped.items():
+                            await state_repository.upsert_entry_price(
+                                db, sym.upper(), float(price), "bravos_trades_scrape"
+                            )
+                        bravos_entry_prices = await state_repository.get_all_entry_prices(db)
 
             if bravos_entry_prices:
                 log.info("bravos_entry_prices_loaded", count=len(bravos_entry_prices))

@@ -99,6 +99,38 @@ async def lifespan(app: FastAPI):
             logger.info(f"Ledger bootstrap: {result}")
         except Exception as e:
             logger.warning(f"Ledger bootstrap failed (non-fatal): {e}")
+
+        # Seed Bravos entry prices for known active positions.
+        # Idempotent: upsert uses ON CONFLICT DO NOTHING, so existing rows
+        # (whether seeded or scraped later) are never overwritten. Adding a
+        # new entry here just means it'll be present on the next deploy.
+        try:
+            from src.db.repositories.state_repository import state_repository
+            known_entry_prices = {
+                "ALUM": 3.85,
+                "EME": 687.73,
+                "D": 59.50,
+                "FHI": 54.42,
+                "DBC": 24.76,
+                "HSY": 211.75,
+                "NTR": 66.50,
+                "AA": 56.70,
+                "EXC": 49.82,
+                "ANDE": 58.50,
+                "CENX": 55.50,
+                "NEE": 92.20,
+                "LIN": 487.00,
+            }
+            inserted = 0
+            async with get_db_context() as db:
+                for sym, price in known_entry_prices.items():
+                    if await state_repository.upsert_entry_price(
+                        db, sym, float(price), "seed"
+                    ):
+                        inserted += 1
+            logger.info(f"Entry price seed: inserted {inserted} new rows")
+        except Exception as e:
+            logger.warning(f"Entry price seed failed (non-fatal): {e}")
     except Exception as e:
         logger.error(f"Database startup failed: {e}")
 
