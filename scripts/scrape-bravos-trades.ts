@@ -417,6 +417,20 @@ async function main() {
   console.log('='.repeat(60));
   console.log('');
 
+  // Parse --symbols=ALUM,EME filter. If provided, only those symbols are
+  // scraped (used by the browser worker to fetch missing entry prices on
+  // demand without re-visiting every position's journal pages).
+  const symbolsArg = process.argv.find((a) => a.startsWith('--symbols='));
+  const symbolFilter = symbolsArg
+    ? new Set(
+        symbolsArg
+          .slice('--symbols='.length)
+          .split(',')
+          .map((s) => s.trim().toUpperCase())
+          .filter(Boolean)
+      )
+    : null;
+
   if (!existsSync(SESSION_PATH)) {
     console.error('No session found. Run: npm run init-session');
     process.exit(1);
@@ -433,6 +447,9 @@ async function main() {
   const targetSymbols = new Map<string, { weight: number; side: 'long' | 'short'; name: string }>();
 
   for (const trade of activeTrades.trades) {
+    if (symbolFilter && !symbolFilter.has(trade.symbol.toUpperCase())) {
+      continue;
+    }
     targetSymbols.set(trade.symbol, {
       weight: trade.weight,
       side: trade.action.toLowerCase() as 'long' | 'short',
@@ -440,7 +457,13 @@ async function main() {
     });
   }
 
-  console.log(`Targeting ${targetSymbols.size} active positions\n`);
+  if (symbolFilter) {
+    console.log(
+      `Filter: ${[...symbolFilter].join(', ')} — matched ${targetSymbols.size} of ${activeTrades.trades.length} active positions\n`
+    );
+  } else {
+    console.log(`Targeting ${targetSymbols.size} active positions\n`);
+  }
 
   const storageState = JSON.parse(readFileSync(SESSION_PATH, 'utf-8'));
   const browser = await chromium.launch({ headless: true });

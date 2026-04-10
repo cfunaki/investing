@@ -83,6 +83,23 @@ class ScrapeRequest(BaseModel):
     force_refresh: bool = False  # Force re-scrape even if recent data exists
 
 
+class BravosTradesRequest(BaseModel):
+    """Request for the detailed Bravos trades (entry price) scrape."""
+
+    symbols: list[str] | None = None  # If set, only scrape these symbols
+
+
+class BravosTradesResponse(BaseModel):
+    """Response from the detailed Bravos trades scrape."""
+
+    success: bool
+    scraped_at: str
+    latency_ms: int
+    trades: dict[str, Any] = {}
+    error: str | None = None
+    error_type: str | None = None
+
+
 class Allocation(BaseModel):
     """A single portfolio allocation."""
 
@@ -530,6 +547,164 @@ async def scrape_bravos(request: ScrapeRequest | None = None) -> ScrapeResponse:
             scraped_at=datetime.now(timezone.utc).isoformat(),
             latency_ms=latency_ms,
             cold_start=was_cold_start,
+            error=str(e),
+            error_type="unknown",
+        )
+
+
+@app.post("/scrape/bravos-trades", response_model=BravosTradesResponse)
+async def scrape_bravos_trades(
+    request: BravosTradesRequest | None = None,
+) -> BravosTradesResponse:
+    """
+    Detailed Bravos trades scrape — visits each symbol's journal pages to
+    extract entry prices. Much slower than /scrape/bravos (visits per-trade
+    detail pages), so only call this when you actually need entry prices
+    for symbols that aren't already cached in the database.
+
+    Self-contained across Cloud Run instances: always runs scrape-active-trades
+    first inside this same request so the required input file
+    (data/raw/active-trades-latest.json) exists on this container's disk.
+    """
+    start_time = time.time()
+    symbols = request.symbols if request else None
+    log = logger.bind(
+        sleeve="bravos",
+        endpoint="bravos-trades",
+        symbol_count=len(symbols) if symbols else 0,
+    )
+    log.info("bravos_trades_scrape_started", symbols=symbols)
+
+    # Session check
+    if not check_session_exists():
+        latency_ms = int((time.time() - start_time) * 1000)
+        log.warning("bravos_trades_no_session", latency_ms=latency_ms)
+        return BravosTradesResponse(
+            success=False,
+            scraped_at=datetime.now(timezone.utc).isoformat(),
+            latency_ms=latency_ms,
+            error="No Bravos session found. Run 'npm run init-session' to authenticate.",
+            error_type="auth",
+        )
+
+    try:
+        # Step 1: Run active-trades first to produce the input file that
+        # scrape-bravos-trades.ts requires. This makes the endpoint
+        # self-contained — no dependency on prior calls having populated
+        # the container's filesystem.
+        active_result = await asyncio.to_thread(
+            subprocess.run,
+            ["npx", "tsx", "scripts/scrape-active-trades.ts"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=90,
+            env={
+                **os.environ,
+                "BRAVOS_BASE_URL": BRAVOS_BASE_URL,
+                "BRAVOS_USERNAME": BRAVOS_USERNAME,
+                "BRAVOS_PASSWORD": BRAVOS_PASSWORD,
+            },
+        )
+        if active_result.returncode != 0:
+            latency_ms = int((time.time() - start_time) * 1000)
+            err = active_result.stderr[:500] if active_result.stderr else "unknown"
+            log.error("active_trades_prereq_failed", error=err, latency_ms=latency_ms)
+            return BravosTradesResponse(
+                success=False,
+                scraped_at=datetime.now(timezone.utc).isoformat(),
+                latency_ms=latency_ms,
+                error=f"active-trades prerequisite failed: {err}",
+                error_type="unknown",
+            )
+
+        # Step 2: Run the detailed trades scrape, filtered to the requested
+        # symbols if any were provided.
+        args = ["npx", "tsx", "scripts/scrape-bravos-trades.ts"]
+        if symbols:
+            args.append(f"--symbols={','.join(symbols)}")
+
+        trades_result = await asyncio.to_thread(
+            subprocess.run,
+            args,
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=480,  # 8 min hard cap — per-symbol scrapes are slow
+            env={
+                **os.environ,
+                "BRAVOS_BASE_URL": BRAVOS_BASE_URL,
+                "BRAVOS_USERNAME": BRAVOS_USERNAME,
+                "BRAVOS_PASSWORD": BRAVOS_PASSWORD,
+            },
+        )
+        if trades_result.returncode != 0:
+            latency_ms = int((time.time() - start_time) * 1000)
+            err = trades_result.stderr[:500] if trades_result.stderr else "unknown"
+            log.error("bravos_trades_scrape_failed", error=err, latency_ms=latency_ms)
+            return BravosTradesResponse(
+                success=False,
+                scraped_at=datetime.now(timezone.utc).isoformat(),
+                latency_ms=latency_ms,
+                error=f"scrape-bravos-trades failed: {err}",
+                error_type="unknown",
+            )
+
+        # Step 3: Read the output file the script produced.
+        output_file = PROJECT_ROOT / "data" / "processed" / "bravos_trades.json"
+        if not output_file.exists():
+            latency_ms = int((time.time() - start_time) * 1000)
+            log.error("bravos_trades_output_missing", latency_ms=latency_ms)
+            return BravosTradesResponse(
+                success=False,
+                scraped_at=datetime.now(timezone.utc).isoformat(),
+                latency_ms=latency_ms,
+                error="Scraper completed but output file not found",
+                error_type="parse",
+            )
+
+        with open(output_file) as f:
+            data = json.load(f)
+
+        trades = data.get("trades", {}) or {}
+        latency_ms = int((time.time() - start_time) * 1000)
+        log.info(
+            "bravos_trades_scrape_completed",
+            trade_count=len(trades),
+            latency_ms=latency_ms,
+        )
+
+        # Upload session for persistence
+        if GCS_SESSION_BUCKET:
+            try:
+                upload_session_to_gcs()
+            except Exception as e:
+                log.warning("session_upload_failed", error=str(e))
+
+        return BravosTradesResponse(
+            success=True,
+            scraped_at=datetime.now(timezone.utc).isoformat(),
+            latency_ms=latency_ms,
+            trades=trades,
+        )
+
+    except subprocess.TimeoutExpired:
+        latency_ms = int((time.time() - start_time) * 1000)
+        log.error("bravos_trades_timeout", latency_ms=latency_ms)
+        return BravosTradesResponse(
+            success=False,
+            scraped_at=datetime.now(timezone.utc).isoformat(),
+            latency_ms=latency_ms,
+            error="Scraper timed out",
+            error_type="timeout",
+        )
+    except Exception as e:
+        latency_ms = int((time.time() - start_time) * 1000)
+        log.exception("bravos_trades_exception", error=str(e), latency_ms=latency_ms)
+        return BravosTradesResponse(
+            success=False,
+            scraped_at=datetime.now(timezone.utc).isoformat(),
+            latency_ms=latency_ms,
             error=str(e),
             error_type="unknown",
         )
