@@ -808,6 +808,53 @@ async def debug_webhook():
     return info
 
 
+@app.get("/debug/positions", tags=["Debug"])
+async def debug_positions():
+    """Return current Robinhood positions with current prices and values."""
+    from src.brokers.robinhood import get_robinhood_adapter
+
+    broker = get_robinhood_adapter()
+    if not await broker.is_connected():
+        connected = await broker.connect()
+        if not connected:
+            raise HTTPException(
+                status_code=503,
+                detail="Cannot connect to Robinhood. Use /login first.",
+            )
+
+    positions = await broker.get_positions()
+
+    # Get current quotes for market values
+    symbols = [p.symbol for p in positions]
+    quotes = await broker.get_quotes(symbols) if symbols else {}
+
+    result = []
+    total_value = 0.0
+    for p in positions:
+        quote = quotes.get(p.symbol)
+        price = float(quote.last) if quote and quote.last else float(p.average_cost)
+        qty = float(p.quantity)
+        value = price * qty
+        total_value += value
+        result.append({
+            "symbol": p.symbol,
+            "quantity": qty,
+            "avg_cost": float(p.average_cost),
+            "current_price": price,
+            "market_value": round(value, 2),
+            "cost_basis": round(qty * float(p.average_cost), 2),
+            "unrealized_pl": round(value - (qty * float(p.average_cost)), 2),
+        })
+
+    result.sort(key=lambda x: x["market_value"], reverse=True)
+
+    return {
+        "position_count": len(result),
+        "total_market_value": round(total_value, 2),
+        "positions": result,
+    }
+
+
 @app.post("/debug/webhook", tags=["Debug"])
 async def set_webhook(webhook_url: str):
     """Manually set the Telegram webhook URL."""
