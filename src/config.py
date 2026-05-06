@@ -120,7 +120,7 @@ class Settings(BaseSettings):
         default=0.05,
         description="Maximum portfolio change as a fraction (0.05 = 5%)",
         ge=0.01,
-        le=0.25,
+        le=1.0,
     )
     market_hours_only: bool = Field(
         default=True,
