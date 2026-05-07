@@ -803,6 +803,51 @@ async def set_webhook(webhook_url: str):
         raise HTTPException(status_code=500, detail="Failed to set webhook")
 
 
+@app.get("/admin/sleeve/{name}", tags=["Admin"])
+async def admin_get_sleeve(name: str):
+    """Return sleeve config row (unit_size, allocation, etc)."""
+    from decimal import Decimal
+    from src.db.repositories.sleeve_repository import sleeve_repository
+
+    async with get_db_context() as db:
+        sleeve = await sleeve_repository.get_by_name(db, name)
+        if not sleeve:
+            raise HTTPException(status_code=404, detail=f"Sleeve '{name}' not found")
+        return {
+            "id": str(sleeve.id),
+            "name": sleeve.name,
+            "adapter_type": sleeve.adapter_type,
+            "enabled": sleeve.enabled,
+            "allocation_mode": sleeve.allocation_mode,
+            "allocation_value": float(sleeve.allocation_value) if sleeve.allocation_value else None,
+            "unit_size": float(sleeve.unit_size),
+            "approval_required": sleeve.approval_required,
+        }
+
+
+@app.post("/admin/sleeve/{name}/unit-size", tags=["Admin"])
+async def admin_set_unit_size(name: str, unit_size: float):
+    """Update a sleeve's unit_size. Used to scale rebalance trade sizes."""
+    from decimal import Decimal
+    from sqlalchemy import update
+    from src.db.models import Sleeve
+    from src.db.repositories.sleeve_repository import sleeve_repository
+
+    if unit_size <= 0:
+        raise HTTPException(status_code=400, detail="unit_size must be > 0")
+
+    async with get_db_context() as db:
+        sleeve = await sleeve_repository.get_by_name(db, name)
+        if not sleeve:
+            raise HTTPException(status_code=404, detail=f"Sleeve '{name}' not found")
+        old = float(sleeve.unit_size)
+        await db.execute(
+            update(Sleeve).where(Sleeve.id == sleeve.id).values(unit_size=Decimal(str(unit_size)))
+        )
+        await db.commit()
+        return {"sleeve": name, "unit_size_old": old, "unit_size_new": unit_size}
+
+
 # =============================================================================
 # Bravos Scheduler Endpoint
 # =============================================================================
