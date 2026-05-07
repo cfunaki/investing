@@ -300,6 +300,19 @@ class RobinhoodAdapter(BrokerAdapter):
                             f"get_prompts_status/"
                         )
                         log.info("waiting_for_device_approval")
+                        try:
+                            future = asyncio.run_coroutine_threadsafe(
+                                send_prompt_fn(
+                                    "*Robinhood device approval*\n\n"
+                                    "Open the Robinhood mobile app and tap "
+                                    "*Approve* on the login prompt.\n\n"
+                                    "_Waiting up to 2 minutes…_"
+                                ),
+                                loop,
+                            )
+                            future.result(timeout=10)
+                        except Exception as e:
+                            log.warning("device_prompt_send_failed", error=str(e))
                         while time.time() - start_time < 120:
                             time.sleep(5)
                             status = request_get(url=prompt_url)
