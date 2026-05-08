@@ -848,6 +848,77 @@ async def admin_set_unit_size(name: str, unit_size: float):
         return {"sleeve": name, "unit_size_old": old, "unit_size_new": unit_size}
 
 
+@app.get("/admin/sleeve/{name}/positions", tags=["Admin"])
+async def admin_get_positions(name: str):
+    """List sleeve ledger positions (qty + weight) for a sleeve."""
+    from src.db.repositories.sleeve_repository import sleeve_repository
+    from src.db.repositories.sleeve_position_repository import sleeve_position_repository
+
+    async with get_db_context() as db:
+        sleeve = await sleeve_repository.get_by_name(db, name)
+        if not sleeve:
+            raise HTTPException(status_code=404, detail=f"Sleeve '{name}' not found")
+        positions = await sleeve_position_repository.get_by_sleeve(db, sleeve.id)
+        return {
+            "sleeve": name,
+            "positions": [
+                {
+                    "symbol": p.symbol,
+                    "shares": float(p.shares),
+                    "weight": float(p.weight) if p.weight else None,
+                    "cost_basis": float(p.cost_basis) if p.cost_basis else None,
+                }
+                for p in positions
+            ],
+        }
+
+
+@app.post("/admin/sleeve/{name}/positions/sync-from-rh", tags=["Admin"])
+async def admin_sync_positions_from_rh(name: str):
+    """Reconcile sleeve_positions to actual Robinhood holdings.
+
+    For each symbol currently in the sleeve ledger, look up its real Robinhood
+    quantity. If RH shows 0 (fully sold), delete the ledger row. If non-zero,
+    update the ledger qty to match. Symbols held in RH but not in this sleeve
+    are left alone (they belong to other sleeves or are external).
+    """
+    from decimal import Decimal
+    from src.brokers.robinhood import get_robinhood_adapter
+    from src.db.repositories.sleeve_repository import sleeve_repository
+    from src.db.repositories.sleeve_position_repository import sleeve_position_repository
+
+    broker = get_robinhood_adapter()
+    if not await broker.is_connected():
+        connected = await broker.connect()
+        if not connected:
+            raise HTTPException(status_code=503, detail="Cannot connect to Robinhood. Use /login first.")
+
+    rh_positions = await broker.get_positions()
+    rh_qty = {p.symbol: float(p.quantity) for p in rh_positions}
+
+    changes = []
+    async with get_db_context() as db:
+        sleeve = await sleeve_repository.get_by_name(db, name)
+        if not sleeve:
+            raise HTTPException(status_code=404, detail=f"Sleeve '{name}' not found")
+        ledger = await sleeve_position_repository.get_by_sleeve(db, sleeve.id)
+
+        for pos in ledger:
+            real_qty = rh_qty.get(pos.symbol, 0.0)
+            old_qty = float(pos.shares)
+            if abs(real_qty - old_qty) < 1e-6:
+                continue
+            if real_qty <= 0:
+                await sleeve_position_repository.delete_position(db, sleeve.id, pos.symbol)
+                changes.append({"symbol": pos.symbol, "action": "deleted", "old_qty": old_qty, "new_qty": 0.0})
+            else:
+                await sleeve_position_repository.update_position(db, pos, shares=Decimal(str(real_qty)))
+                changes.append({"symbol": pos.symbol, "action": "updated", "old_qty": old_qty, "new_qty": real_qty})
+        await db.commit()
+
+    return {"sleeve": name, "changes": changes, "unchanged_count": len(ledger) - len(changes)}
+
+
 # =============================================================================
 # Bravos Scheduler Endpoint
 # =============================================================================
