@@ -11,6 +11,7 @@ This module is responsible for:
 This is where all the safety layers come together.
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -266,8 +267,12 @@ class TradeExecutor:
             report.completed_at = datetime.now(timezone.utc)
             return report
 
-        # Execute each trade
-        for trade in trades:
+        # Execute each trade. Pace submissions: Robinhood degrades responses
+        # (returns empty bodies / Unknown error) when many orders arrive in
+        # quick succession on the same session.
+        for i, trade in enumerate(trades):
+            if i > 0:
+                await asyncio.sleep(2)
             result = await self._execute_single_trade(approval_id, trade, account_info)
             report.results.append(result)
 

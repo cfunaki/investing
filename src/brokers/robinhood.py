@@ -597,9 +597,10 @@ class RobinhoodAdapter(BrokerAdapter):
                         status=OrderStatus.FAILED,
                         error=f"Unable to get quote for {request.symbol}",
                     )
-                # Calculate shares from notional
+                # Calculate shares from notional. Robinhood's order API rejects
+                # quantities with more than 8 decimal places, so round here.
                 price = quote.last
-                quantity = request.notional / price
+                quantity = round(request.notional / price, 6)
                 log.info("calculated_quantity", price=price, quantity=quantity)
 
             # Map time in force
