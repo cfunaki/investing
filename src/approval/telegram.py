@@ -485,8 +485,34 @@ class TelegramBot:
             log.warning("invalid_callback_data", error=str(e))
             return
 
-        # Find the approval request
+        # Find the approval request: in-memory first, then DB. The DB fallback
+        # is critical because Cloud Run instances recycle and lose in-memory
+        # state, leaving valid pending approvals unhandleable via callback.
         approval = self._pending_approvals.get(approval_code)
+        if not approval:
+            try:
+                from src.db.repositories.approval_repository import approval_repository
+                from src.db.session import get_db_context
+
+                async with get_db_context() as db:
+                    db_approval = await approval_repository.get_by_code(db, approval_code)
+                    if db_approval and db_approval.status == "pending":
+                        approval = ApprovalRequest(
+                            approval_id=db_approval.id,
+                            reconciliation_id=db_approval.reconciliation_id,
+                            sleeve_name="bravos",
+                            proposed_trades=db_approval.proposed_trades,
+                            total_notional=sum(t.get("notional", 0) for t in db_approval.proposed_trades),
+                            approval_code=approval_code,
+                            expires_at=db_approval.expires_at,
+                            message_id=int(db_approval.telegram_message_id) if db_approval.telegram_message_id else None,
+                            chat_id=update.effective_chat.id,
+                        )
+                        self._pending_approvals[approval_code] = approval
+                        log.info("approval_loaded_from_db_in_callback", approval_code=approval_code)
+            except Exception as e:
+                log.warning("approval_db_lookup_failed", error=str(e))
+
         if not approval:
             log.warning("approval_not_found", approval_code=approval_code)
             await query.answer("This approval request has expired or was already processed.", show_alert=True)

@@ -848,6 +848,26 @@ async def admin_set_unit_size(name: str, unit_size: float):
         return {"sleeve": name, "unit_size_old": old, "unit_size_new": unit_size}
 
 
+@app.post("/admin/approval/{approval_id}/execute", tags=["Admin"])
+async def admin_execute_approval(approval_id: str):
+    """Force execution of a pending approval. Used when a Telegram callback
+    fails (e.g. due to Cloud Run instance recycle losing in-memory state),
+    leaving a valid DB approval that the user cannot tap through."""
+    from uuid import UUID
+    from src.approval.workflow import get_approval_workflow
+
+    workflow = get_approval_workflow()
+    try:
+        await workflow._handle_approval(
+            approval_id=UUID(approval_id),
+            approved_by="admin",
+            user_name="admin",
+        )
+        return {"approval_id": approval_id, "status": "execution_triggered"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/sleeve/{name}/positions", tags=["Admin"])
 async def admin_get_positions(name: str):
     """List sleeve ledger positions (qty + weight) for a sleeve."""
