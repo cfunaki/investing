@@ -172,8 +172,16 @@ class DeltaReconciler:
 
         for symbol in all_symbols:
             current_pos = current_positions.get(symbol)
-            old_weight = current_pos.weight if current_pos else Decimal(0)
             new_weight = new_weights.get(symbol, Decimal(0))
+            if current_pos is None:
+                old_weight = Decimal(0)
+            elif current_pos.weight is not None:
+                old_weight = current_pos.weight
+            else:
+                # Position exists but weight metadata is missing (e.g. recovered
+                # from RH via admin sync). Assume already at target so we don't
+                # propose to re-enter a position the user already holds.
+                old_weight = new_weight
 
             # Determine action
             if old_weight == 0 and new_weight > 0:
