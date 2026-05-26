@@ -874,13 +874,17 @@ async def admin_get_positions(name: str):
 
 
 @app.post("/admin/sleeve/{name}/positions/sync-from-rh", tags=["Admin"])
-async def admin_sync_positions_from_rh(name: str):
+async def admin_sync_positions_from_rh(name: str, add_symbols: str = ""):
     """Reconcile sleeve_positions to actual Robinhood holdings.
 
     For each symbol currently in the sleeve ledger, look up its real Robinhood
     quantity. If RH shows 0 (fully sold), delete the ledger row. If non-zero,
     update the ledger qty to match. Symbols held in RH but not in this sleeve
     are left alone (they belong to other sleeves or are external).
+
+    Pass add_symbols=SYM1,SYM2,... to also create ledger rows for those
+    symbols by reading their current RH quantity. Used to recover from
+    queued-execution fills that never wrote back to the ledger.
     """
     from decimal import Decimal
     from src.brokers.robinhood import get_robinhood_adapter
@@ -902,6 +906,7 @@ async def admin_sync_positions_from_rh(name: str):
         if not sleeve:
             raise HTTPException(status_code=404, detail=f"Sleeve '{name}' not found")
         ledger = await sleeve_position_repository.get_by_sleeve(db, sleeve.id)
+        ledger_symbols = {p.symbol for p in ledger}
 
         for pos in ledger:
             real_qty = rh_qty.get(pos.symbol, 0.0)
@@ -914,9 +919,24 @@ async def admin_sync_positions_from_rh(name: str):
             else:
                 await sleeve_position_repository.update_position(db, pos, shares=Decimal(str(real_qty)))
                 changes.append({"symbol": pos.symbol, "action": "updated", "old_qty": old_qty, "new_qty": real_qty})
+
+        # Optionally create rows for new symbols missing from the ledger
+        wanted = [s.strip().upper() for s in add_symbols.split(",") if s.strip()]
+        for sym in wanted:
+            if sym in ledger_symbols:
+                continue
+            real_qty = rh_qty.get(sym, 0.0)
+            if real_qty <= 0:
+                changes.append({"symbol": sym, "action": "skipped", "reason": "not in RH"})
+                continue
+            await sleeve_position_repository.create_position(
+                db, sleeve.id, sym, shares=Decimal(str(real_qty))
+            )
+            changes.append({"symbol": sym, "action": "created", "old_qty": 0.0, "new_qty": real_qty})
+
         await db.commit()
 
-    return {"sleeve": name, "changes": changes, "unchanged_count": len(ledger) - len(changes)}
+    return {"sleeve": name, "changes": changes}
 
 
 # =============================================================================
