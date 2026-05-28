@@ -848,6 +848,123 @@ async def admin_set_unit_size(name: str, unit_size: float):
         return {"sleeve": name, "unit_size_old": old, "unit_size_new": unit_size}
 
 
+@app.post("/admin/sleeve/{name}/trim", tags=["Admin"])
+async def admin_trim_sleeve(name: str, factor: float = 0.1):
+    """Generate an approval that sells `factor` of each ledger position in
+    the sleeve. User taps Approve in Telegram to execute, just like a normal
+    Bravos rebalance approval. factor=0.1 means trim 10% from each."""
+    from datetime import timedelta
+    from decimal import Decimal
+    from src.approval.telegram import (
+        ApprovalRequest,
+        generate_approval_code,
+        get_telegram_bot,
+    )
+    from src.approval.workflow import get_approval_workflow
+    from src.brokers.robinhood import get_robinhood_adapter
+    from src.config import get_settings
+    from src.db.repositories.approval_repository import approval_repository
+    from src.db.repositories.reconciliation_repository import reconciliation_repository
+    from src.db.repositories.sleeve_repository import sleeve_repository
+    from src.db.repositories.sleeve_position_repository import sleeve_position_repository
+    import structlog
+
+    log = structlog.get_logger(__name__).bind(endpoint="admin_trim_sleeve")
+
+    if factor <= 0 or factor >= 1:
+        raise HTTPException(status_code=400, detail="factor must be in (0,1)")
+
+    settings = get_settings()
+    broker = get_robinhood_adapter()
+    if not await broker.is_connected():
+        if not await broker.connect():
+            raise HTTPException(status_code=503, detail="RH unreachable - use /login")
+
+    async with get_db_context() as db:
+        sleeve = await sleeve_repository.get_by_name(db, name)
+        if not sleeve:
+            raise HTTPException(status_code=404, detail=f"Sleeve {name} not found")
+        positions = await sleeve_position_repository.get_by_sleeve(db, sleeve.id)
+
+    if not positions:
+        raise HTTPException(status_code=400, detail="No positions in sleeve")
+
+    symbols = [p.symbol for p in positions]
+    quotes = await broker.get_quotes(symbols)
+
+    trades = []
+    for pos in positions:
+        sell_qty = round(float(pos.shares) * factor, 6)
+        if sell_qty <= 0:
+            continue
+        quote = quotes.get(pos.symbol)
+        price = float(quote.last) if quote and quote.last else 0.0
+        trades.append({
+            "symbol": pos.symbol,
+            "side": "sell",
+            "notional": 0,
+            "quantity": sell_qty,
+            "proposal_price": price,
+            "delta_weight": -factor,
+            "target_weight": 0,
+            "rationale": f"Manual trim {factor * 100:.0f}%",
+        })
+
+    if not trades:
+        raise HTTPException(status_code=400, detail="No trades generated")
+
+    approval_code = generate_approval_code()
+    requested_at = datetime.now(timezone.utc)
+    expires_at = requested_at + timedelta(minutes=settings.approval_expiry_minutes)
+
+    async with get_db_context() as db:
+        source_event_id = f"trim_{approval_code}_{requested_at.timestamp()}"
+        signal, intent, recon = await reconciliation_repository.create_full_chain(
+            db=db,
+            sleeve_id=sleeve.id,
+            source_event_id=source_event_id,
+            event_type="manual_trim",
+            proposed_trades=trades,
+            holdings_snapshot={},
+            target_allocations={},
+        )
+        db_approval = await approval_repository.create(
+            db=db,
+            reconciliation_id=recon.id,
+            approval_code=approval_code,
+            proposed_trades=trades,
+            requested_at=requested_at,
+            expires_at=expires_at,
+        )
+        approval_id = db_approval.id
+
+    workflow = get_approval_workflow()
+    sleeve_mv_before, portfolio_mv = await workflow._compute_sleeve_context(name, log)
+
+    total_proceeds_est = sum(t["quantity"] * t["proposal_price"] for t in trades)
+    bot = get_telegram_bot()
+    request = ApprovalRequest(
+        approval_id=approval_id,
+        reconciliation_id=recon.id,
+        sleeve_name=name,
+        proposed_trades=trades,
+        total_notional=total_proceeds_est,
+        approval_code=approval_code,
+        expires_at=expires_at,
+        sleeve_mv_before=sleeve_mv_before,
+        portfolio_mv=portfolio_mv,
+    )
+    message_id = await bot.send_approval_request(request)
+
+    return {
+        "approval_code": approval_code,
+        "approval_id": str(approval_id),
+        "trade_count": len(trades),
+        "estimated_proceeds": round(total_proceeds_est, 2),
+        "telegram_message_id": message_id,
+    }
+
+
 @app.post("/admin/approval/{approval_id}/execute", tags=["Admin"])
 async def admin_execute_approval(approval_id: str):
     """Force execution of a pending approval. Used when a Telegram callback
