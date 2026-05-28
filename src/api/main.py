@@ -1004,20 +1004,15 @@ async def admin_consolidate_approvals(name: str):
         return {"note": "Only one pending approval; nothing to consolidate",
                 "approval_code": sleeve_pending[0].approval_code}
 
-    # Merge trades, dedup by (symbol, side) by summing notional/quantity
+    # Merge trades by (symbol, side). On overlap, the more recently created
+    # approval wins (its trade replaces the earlier one). Summing across stale
+    # approvals double-counts the same intent.
+    sleeve_pending_sorted = sorted(sleeve_pending, key=lambda a: a.requested_at)
     combined: dict[tuple[str, str], dict] = {}
-    for ap in sleeve_pending:
+    for ap in sleeve_pending_sorted:
         for trade in ap.proposed_trades:
             key = (trade.get("symbol", "?"), trade.get("side", "?").lower())
-            if key in combined:
-                # Sum notional and quantity for duplicate symbol/side
-                existing = combined[key]
-                existing["notional"] = (existing.get("notional") or 0) + (trade.get("notional") or 0)
-                existing_qty = existing.get("quantity") or 0
-                add_qty = trade.get("quantity") or 0
-                existing["quantity"] = existing_qty + add_qty if (existing_qty or add_qty) else None
-            else:
-                combined[key] = dict(trade)
+            combined[key] = dict(trade)
 
     trades = list(combined.values())
     if not trades:
@@ -1081,6 +1076,30 @@ async def admin_consolidate_approvals(name: str):
         "cancelled_approvals": [ap.approval_code for ap in sleeve_pending],
         "telegram_message_id": message_id,
     }
+
+
+@app.post("/admin/approval/{approval_code_or_id}/cancel", tags=["Admin"])
+async def admin_cancel_approval(approval_code_or_id: str):
+    """Cancel a pending approval by code (8 hex chars) or full UUID."""
+    from uuid import UUID
+    from src.db.repositories.approval_repository import approval_repository
+
+    async with get_db_context() as db:
+        try:
+            approval_id = UUID(approval_code_or_id)
+        except ValueError:
+            ap = await approval_repository.get_by_code(db, approval_code_or_id)
+            if not ap:
+                raise HTTPException(status_code=404, detail=f"Approval {approval_code_or_id} not found")
+            approval_id = ap.id
+
+        await approval_repository.update_status(
+            db=db, approval_id=approval_id,
+            status="cancelled", approved_by="admin",
+            responded_at=datetime.now(timezone.utc),
+        )
+
+    return {"approval_id": str(approval_id), "status": "cancelled"}
 
 
 @app.post("/admin/approval/{approval_id}/execute", tags=["Admin"])
