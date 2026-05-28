@@ -965,6 +965,124 @@ async def admin_trim_sleeve(name: str, factor: float = 0.1):
     }
 
 
+@app.post("/admin/sleeve/{name}/consolidate-approvals", tags=["Admin"])
+async def admin_consolidate_approvals(name: str):
+    """Merge all pending approvals for the sleeve into a single new approval
+    and cancel the originals. User then only has to tap one button."""
+    from datetime import timedelta
+    from src.approval.telegram import (
+        ApprovalRequest,
+        generate_approval_code,
+        get_telegram_bot,
+    )
+    from src.approval.workflow import get_approval_workflow
+    from src.config import get_settings
+    from src.db.repositories.approval_repository import approval_repository
+    from src.db.repositories.reconciliation_repository import reconciliation_repository
+    from src.db.repositories.sleeve_repository import sleeve_repository
+    import structlog
+
+    log = structlog.get_logger(__name__).bind(endpoint="consolidate_approvals")
+    settings = get_settings()
+
+    async with get_db_context() as db:
+        sleeve = await sleeve_repository.get_by_name(db, name)
+        if not sleeve:
+            raise HTTPException(status_code=404, detail=f"Sleeve {name} not found")
+
+        all_pending = await approval_repository.get_pending(db)
+        # Filter to approvals whose reconciliation belongs to this sleeve
+        sleeve_pending = []
+        for ap in all_pending:
+            sleeve_id = await approval_repository.get_sleeve_id_for_approval(db, ap.id)
+            if sleeve_id == sleeve.id:
+                sleeve_pending.append(ap)
+
+    if not sleeve_pending:
+        raise HTTPException(status_code=400, detail="No pending approvals to consolidate")
+    if len(sleeve_pending) == 1:
+        return {"note": "Only one pending approval; nothing to consolidate",
+                "approval_code": sleeve_pending[0].approval_code}
+
+    # Merge trades, dedup by (symbol, side) by summing notional/quantity
+    combined: dict[tuple[str, str], dict] = {}
+    for ap in sleeve_pending:
+        for trade in ap.proposed_trades:
+            key = (trade.get("symbol", "?"), trade.get("side", "?").lower())
+            if key in combined:
+                # Sum notional and quantity for duplicate symbol/side
+                existing = combined[key]
+                existing["notional"] = (existing.get("notional") or 0) + (trade.get("notional") or 0)
+                existing_qty = existing.get("quantity") or 0
+                add_qty = trade.get("quantity") or 0
+                existing["quantity"] = existing_qty + add_qty if (existing_qty or add_qty) else None
+            else:
+                combined[key] = dict(trade)
+
+    trades = list(combined.values())
+    if not trades:
+        raise HTTPException(status_code=400, detail="No trades after merge")
+
+    approval_code = generate_approval_code()
+    requested_at = datetime.now(timezone.utc)
+    expires_at = requested_at + timedelta(minutes=settings.approval_expiry_minutes)
+
+    async with get_db_context() as db:
+        source_event_id = f"consolidate_{approval_code}_{requested_at.timestamp()}"
+        signal, intent, recon = await reconciliation_repository.create_full_chain(
+            db=db,
+            sleeve_id=sleeve.id,
+            source_event_id=source_event_id,
+            event_type="consolidated_rebalance",
+            proposed_trades=trades,
+            holdings_snapshot={},
+            target_allocations={},
+        )
+        db_approval = await approval_repository.create(
+            db=db,
+            reconciliation_id=recon.id,
+            approval_code=approval_code,
+            proposed_trades=trades,
+            requested_at=requested_at,
+            expires_at=expires_at,
+        )
+        approval_id = db_approval.id
+
+        # Cancel the originals so the user doesn't tap them
+        for ap in sleeve_pending:
+            await approval_repository.update_status(
+                db=db, approval_id=ap.id, status="cancelled",
+                approved_by="consolidate", responded_at=requested_at,
+            )
+
+    workflow = get_approval_workflow()
+    sleeve_mv_before, portfolio_mv = await workflow._compute_sleeve_context(name, log)
+
+    total_buy = sum(abs(t.get("notional") or 0) for t in trades if (t.get("side") or "").lower() == "buy")
+    total_notional = total_buy
+    bot = get_telegram_bot()
+    request = ApprovalRequest(
+        approval_id=approval_id,
+        reconciliation_id=recon.id,
+        sleeve_name=name,
+        proposed_trades=trades,
+        total_notional=total_notional,
+        approval_code=approval_code,
+        expires_at=expires_at,
+        sleeve_mv_before=sleeve_mv_before,
+        portfolio_mv=portfolio_mv,
+    )
+    message_id = await bot.send_approval_request(request)
+
+    return {
+        "approval_code": approval_code,
+        "approval_id": str(approval_id),
+        "trade_count": len(trades),
+        "cancelled_approvals": [ap.approval_code for ap in sleeve_pending],
+        "telegram_message_id": message_id,
+    }
+
+
 @app.post("/admin/approval/{approval_id}/execute", tags=["Admin"])
 async def admin_execute_approval(approval_id: str):
     """Force execution of a pending approval. Used when a Telegram callback
