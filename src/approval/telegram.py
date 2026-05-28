@@ -45,6 +45,8 @@ class ApprovalRequest:
     expires_at: datetime
     message_id: int | None = None
     chat_id: int | None = None
+    sleeve_mv_before: float | None = None
+    portfolio_mv: float | None = None
 
 
 def generate_approval_code() -> str:
@@ -155,6 +157,8 @@ class TelegramBot:
         total_notional: float,
         approval_code: str,
         expires_at: datetime,
+        sleeve_mv_before: float | None = None,
+        portfolio_mv: float | None = None,
     ) -> str:
         """Format an approval request message."""
         buys = [t for t in trades if t.get("side", "").lower() == "buy"]
@@ -211,6 +215,27 @@ class TelegramBot:
             f"*Total Buys:* +${total_buy:,.0f}",
             f"*Total Sells:* -${total_sell:,.0f}" if total_sell > 0 else f"*Total Sells:* -$0",
             f"*Net:* {'+'if net >= 0 else '-'}${abs(net):,.0f}",
+        ])
+
+        if sleeve_mv_before is not None:
+            sleeve_mv_after = sleeve_mv_before + total_buy - total_sell
+            sleeve_pct_before = (
+                f" ({sleeve_mv_before / portfolio_mv:.1%})"
+                if portfolio_mv else ""
+            )
+            sleeve_pct_after = (
+                f" ({sleeve_mv_after / portfolio_mv:.1%})"
+                if portfolio_mv else ""
+            )
+            lines.extend([
+                "",
+                f"*Sleeve before:* ${sleeve_mv_before:,.0f}{sleeve_pct_before}",
+                f"*Sleeve after:*  ${sleeve_mv_after:,.0f}{sleeve_pct_after}",
+            ])
+            if portfolio_mv:
+                lines.append(f"*Portfolio total:* ${portfolio_mv:,.0f} _(unchanged — funded from cash)_")
+
+        lines.extend([
             "",
             f"*Expires:* {expires_at.strftime('%H:%M UTC')}",
             "",
@@ -321,6 +346,8 @@ class TelegramBot:
                 total_notional=approval_request.total_notional,
                 approval_code=approval_request.approval_code,
                 expires_at=approval_request.expires_at,
+                sleeve_mv_before=approval_request.sleeve_mv_before,
+                portfolio_mv=approval_request.portfolio_mv,
             )
 
             # Create inline keyboard

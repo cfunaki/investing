@@ -260,6 +260,13 @@ class ApprovalWorkflow:
             expires_at=expires_at,
         )
 
+        # Compute current sleeve MV and portfolio MV for context. Best-effort:
+        # if Robinhood is unreachable, the approval message still sends without
+        # the before/after block.
+        sleeve_mv_before, portfolio_mv = await self._compute_sleeve_context(
+            sleeve_name, log
+        )
+
         # Create request for Telegram
         request = ApprovalRequest(
             approval_id=record.id,
@@ -269,6 +276,8 @@ class ApprovalWorkflow:
             total_notional=record.total_notional,
             approval_code=approval_code,
             expires_at=expires_at,
+            sleeve_mv_before=sleeve_mv_before,
+            portfolio_mv=portfolio_mv,
         )
 
         # Send to Telegram
@@ -308,6 +317,52 @@ class ApprovalWorkflow:
                 "expires_at": expires_at.isoformat(),
             },
         )
+
+    async def _compute_sleeve_context(
+        self, sleeve_name: str, log
+    ) -> tuple[float | None, float | None]:
+        """Compute current sleeve MV and total portfolio MV from RH live prices.
+
+        Returns (sleeve_mv, portfolio_mv) or (None, None) if RH is unreachable
+        or other failure. The approval message degrades gracefully when None.
+        """
+        try:
+            from src.brokers.robinhood import get_robinhood_adapter
+
+            broker = get_robinhood_adapter()
+            if not await broker.is_connected():
+                connected = await broker.connect()
+                if not connected:
+                    log.info("sleeve_context_skipped_rh_unreachable")
+                    return None, None
+
+            positions = await broker.get_positions()
+            if not positions:
+                return None, None
+
+            symbols = [p.symbol for p in positions]
+            quotes = await broker.get_quotes(symbols)
+            prices = {s: float(q.last) for s, q in quotes.items() if q and q.last}
+
+            async with get_db_context() as db:
+                sleeve = await sleeve_repository.get_by_name(db, sleeve_name)
+                if not sleeve:
+                    return None, None
+                ledger = await sleeve_position_repository.get_by_sleeve(db, sleeve.id)
+            ledger_symbols = {p.symbol for p in ledger}
+
+            portfolio_mv = sum(
+                float(p.quantity) * prices.get(p.symbol, 0.0) for p in positions
+            )
+            sleeve_mv = sum(
+                float(p.quantity) * prices.get(p.symbol, 0.0)
+                for p in positions
+                if p.symbol in ledger_symbols
+            )
+            return sleeve_mv, portfolio_mv
+        except Exception as e:
+            log.warning("sleeve_context_compute_failed", error=str(e))
+            return None, None
 
     async def _send_review_alert(
         self,
