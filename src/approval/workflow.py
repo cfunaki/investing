@@ -532,8 +532,11 @@ class ApprovalWorkflow:
                 failed=execution_report.failed,
             )
 
-            # Update the sleeve ledger after successful execution
-            if execution_report.success and execution_report.executed > 0:
+            # Update the sleeve ledger for every trade that actually executed,
+            # even if some others in the same approval failed. The function
+            # only writes ledger rows for trades whose execution record is
+            # successful, so partial-failure batches are safe to pass through.
+            if execution_report.executed > 0:
                 await self._update_ledger_after_execution(
                     record.sleeve_id,
                     record.proposed_trades,

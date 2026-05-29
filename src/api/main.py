@@ -1078,6 +1078,118 @@ async def admin_consolidate_approvals(name: str):
     }
 
 
+@app.post("/admin/sleeve/{name}/custom-sells", tags=["Admin"])
+async def admin_custom_sells(name: str, sells: dict[str, float]):
+    """Body: {SYMBOL: shares_to_sell, ...}. Creates one Approval combining
+    those sells and sends to Telegram. Used to unwind specific over-bought
+    positions without trimming everything proportionally."""
+    from datetime import timedelta
+    from src.approval.telegram import (
+        ApprovalRequest,
+        generate_approval_code,
+        get_telegram_bot,
+    )
+    from src.approval.workflow import get_approval_workflow
+    from src.brokers.robinhood import get_robinhood_adapter
+    from src.config import get_settings
+    from src.db.repositories.approval_repository import approval_repository
+    from src.db.repositories.reconciliation_repository import reconciliation_repository
+    from src.db.repositories.sleeve_repository import sleeve_repository
+    import structlog
+
+    log = structlog.get_logger(__name__).bind(endpoint="admin_custom_sells")
+
+    if not sells:
+        raise HTTPException(status_code=400, detail="sells body cannot be empty")
+
+    settings = get_settings()
+    broker = get_robinhood_adapter()
+    if not await broker.is_connected():
+        if not await broker.connect():
+            raise HTTPException(status_code=503, detail="RH unreachable")
+
+    async with get_db_context() as db:
+        sleeve = await sleeve_repository.get_by_name(db, name)
+        if not sleeve:
+            raise HTTPException(status_code=404, detail=f"Sleeve {name} not found")
+
+    symbols = list(sells.keys())
+    quotes = await broker.get_quotes(symbols)
+
+    trades = []
+    for sym, qty in sells.items():
+        sym = sym.upper()
+        qty = round(float(qty), 6)
+        if qty <= 0:
+            continue
+        quote = quotes.get(sym)
+        price = float(quote.last) if quote and quote.last else 0.0
+        trades.append({
+            "symbol": sym,
+            "side": "sell",
+            "notional": 0,
+            "quantity": qty,
+            "proposal_price": price,
+            "delta_weight": 0,
+            "target_weight": 0,
+            "rationale": "Targeted custom sell",
+        })
+
+    if not trades:
+        raise HTTPException(status_code=400, detail="No valid sell quantities")
+
+    approval_code = generate_approval_code()
+    requested_at = datetime.now(timezone.utc)
+    expires_at = requested_at + timedelta(minutes=settings.approval_expiry_minutes)
+
+    async with get_db_context() as db:
+        source_event_id = f"customsell_{approval_code}_{requested_at.timestamp()}"
+        signal, intent, recon = await reconciliation_repository.create_full_chain(
+            db=db,
+            sleeve_id=sleeve.id,
+            source_event_id=source_event_id,
+            event_type="custom_sell",
+            proposed_trades=trades,
+            holdings_snapshot={},
+            target_allocations={},
+        )
+        db_approval = await approval_repository.create(
+            db=db,
+            reconciliation_id=recon.id,
+            approval_code=approval_code,
+            proposed_trades=trades,
+            requested_at=requested_at,
+            expires_at=expires_at,
+        )
+        approval_id = db_approval.id
+
+    workflow = get_approval_workflow()
+    sleeve_mv_before, portfolio_mv = await workflow._compute_sleeve_context(name, log)
+
+    total_proceeds_est = sum(t["quantity"] * t["proposal_price"] for t in trades)
+    bot = get_telegram_bot()
+    request = ApprovalRequest(
+        approval_id=approval_id,
+        reconciliation_id=recon.id,
+        sleeve_name=name,
+        proposed_trades=trades,
+        total_notional=total_proceeds_est,
+        approval_code=approval_code,
+        expires_at=expires_at,
+        sleeve_mv_before=sleeve_mv_before,
+        portfolio_mv=portfolio_mv,
+    )
+    message_id = await bot.send_approval_request(request)
+
+    return {
+        "approval_code": approval_code,
+        "approval_id": str(approval_id),
+        "trade_count": len(trades),
+        "estimated_proceeds": round(total_proceeds_est, 2),
+        "telegram_message_id": message_id,
+    }
+
+
 @app.post("/admin/approval/{approval_code_or_id}/cancel", tags=["Admin"])
 async def admin_cancel_approval(approval_code_or_id: str):
     """Cancel a pending approval by code (8 hex chars) or full UUID."""
