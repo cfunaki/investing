@@ -145,8 +145,26 @@ class GmailMonitor:
             except Exception as e:
                 logger.warning("failed_to_load_token_from_database", error=str(e))
 
-        # Refresh if expired
+        # Refresh if expired. Before refreshing, defensively reload the latest
+        # version of the token from Secret Manager — another Cloud Run instance
+        # may have already rotated it and our in-process copy now holds a
+        # refresh_token that Google has invalidated. Race condition between
+        # concurrent instances was the cause of repeated invalid_grant errors.
         if creds and creds.expired and creds.refresh_token:
+            latest_token = self._load_latest_token_from_secret_manager()
+            if latest_token:
+                try:
+                    latest_data = json.loads(latest_token)
+                    latest_creds = Credentials.from_authorized_user_info(latest_data, SCOPES)
+                    if latest_creds and not latest_creds.expired:
+                        logger.info("loaded_fresh_token_from_secret_manager_skip_refresh")
+                        return latest_creds
+                    if latest_creds and latest_creds.refresh_token:
+                        creds = latest_creds
+                        logger.info("using_latest_token_for_refresh")
+                except Exception as e:
+                    logger.warning("failed_to_reload_latest_token", error=str(e))
+
             try:
                 creds.refresh(Request())
                 logger.info("refreshed_gmail_credentials")
@@ -187,6 +205,24 @@ class GmailMonitor:
             logger.info("saved_new_gmail_token", path=str(token_path))
 
         return creds
+
+    def _load_latest_token_from_secret_manager(self) -> str | None:
+        """Read the most recent GMAIL_TOKEN_JSON version from Secret Manager.
+
+        Used to defensively pick up a refresh_token rotation performed by
+        a different Cloud Run instance, avoiding invalid_grant from using
+        our stale in-memory copy.
+        """
+        try:
+            from google.cloud import secretmanager
+            client = secretmanager.SecretManagerServiceClient()
+            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "investing-automation-490206")
+            secret_path = f"projects/{project_id}/secrets/GMAIL_TOKEN_JSON/versions/latest"
+            response = client.access_secret_version(request={"name": secret_path})
+            return response.payload.data.decode("utf-8")
+        except Exception as e:
+            logger.warning("secret_manager_read_failed", error=str(e))
+            return None
 
     def _persist_refreshed_token(self, creds) -> None:
         """Write refreshed Gmail token to Secret Manager and database."""

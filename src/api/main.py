@@ -196,6 +196,47 @@ class SignalProcessingResponse(BaseModel):
 
 
 # =============================================================================
+# Telegram alert helpers
+# =============================================================================
+
+
+async def _maybe_alert_gmail_failure(error: str) -> None:
+    """Send a Telegram alert when a poll fails due to Gmail token revocation.
+    Rate-limited to once per 4 hours via key_value_state."""
+    if "Gmail credentials" not in error and "invalid_grant" not in error:
+        return
+    try:
+        from src.approval.telegram import get_telegram_bot
+        from src.db.repositories.state_repository import state_repository
+
+        async with get_db_context() as db:
+            state = await state_repository.get_state(db, "gmail_alert_last")
+            now = datetime.now(timezone.utc)
+            if state and state.get("sent_at"):
+                try:
+                    last_sent = datetime.fromisoformat(state["sent_at"])
+                    if (now - last_sent).total_seconds() < 14400:
+                        return
+                except Exception:
+                    pass
+
+            bot = get_telegram_bot()
+            await bot.send_notification(
+                "*Gmail token revoked*\n\n"
+                "Bravos emails cannot be read until the OAuth token is refreshed. "
+                "No new approvals will arrive.\n\n"
+                "On the Mac, run:\n"
+                "`cd ~/Documents/GitHub/investing && python scripts/refresh_gmail_token.py`"
+            )
+            await state_repository.set_state(
+                db, "gmail_alert_last", {"sent_at": now.isoformat()}
+            )
+    except Exception:
+        # Never let alerting failure block the calling endpoint
+        pass
+
+
+# =============================================================================
 # Health Endpoints
 # =============================================================================
 
@@ -1358,6 +1399,7 @@ async def job_poll_bravos(force: bool = False, skip_scrape: bool = False):
 
         if not result.success:
             log.error("bravos_poll_failed", error=result.error)
+            await _maybe_alert_gmail_failure(result.error or "")
             return JobResponse(
                 job="poll_bravos",
                 status="failed",
