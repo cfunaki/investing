@@ -1301,7 +1301,9 @@ async def admin_get_positions(name: str):
 
 
 @app.post("/admin/sleeve/{name}/positions/sync-from-rh", tags=["Admin"])
-async def admin_sync_positions_from_rh(name: str, add_symbols: str = ""):
+async def admin_sync_positions_from_rh(
+    name: str, add_symbols: str = "", weights: str = ""
+):
     """Reconcile sleeve_positions to actual Robinhood holdings.
 
     For each symbol currently in the sleeve ledger, look up its real Robinhood
@@ -1312,6 +1314,11 @@ async def admin_sync_positions_from_rh(name: str, add_symbols: str = ""):
     Pass add_symbols=SYM1,SYM2,... to also create ledger rows for those
     symbols by reading their current RH quantity. Used to recover from
     queued-execution fills that never wrote back to the ledger.
+
+    Pass weights=SYM1:5,SYM2:3,... to record each new row's target weight.
+    A row created without a weight is invisible to reconciliation — it can
+    never be trimmed or exited — so any symbol in add_symbols that has no
+    entry in weights is rejected rather than silently created as NULL.
     """
     from decimal import Decimal
     from src.brokers.robinhood import get_robinhood_adapter
@@ -1347,6 +1354,21 @@ async def admin_sync_positions_from_rh(name: str, add_symbols: str = ""):
                 await sleeve_position_repository.update_position(db, pos, shares=Decimal(str(real_qty)))
                 changes.append({"symbol": pos.symbol, "action": "updated", "old_qty": old_qty, "new_qty": real_qty})
 
+        # Parse SYM:weight pairs for the rows we are about to create
+        weight_map: dict[str, Decimal] = {}
+        for pair in weights.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            sym, _, w = pair.partition(":")
+            try:
+                weight_map[sym.strip().upper()] = Decimal(w.strip())
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Malformed weights entry '{pair}'. Expected SYM:weight.",
+                )
+
         # Optionally create rows for new symbols missing from the ledger
         wanted = [s.strip().upper() for s in add_symbols.split(",") if s.strip()]
         for sym in wanted:
@@ -1356,10 +1378,24 @@ async def admin_sync_positions_from_rh(name: str, add_symbols: str = ""):
             if real_qty <= 0:
                 changes.append({"symbol": sym, "action": "skipped", "reason": "not in RH"})
                 continue
+            weight = weight_map.get(sym)
+            if weight is None or weight <= 0:
+                changes.append({
+                    "symbol": sym,
+                    "action": "skipped",
+                    "reason": "no weight supplied; pass weights=SYM:N to create",
+                })
+                continue
             await sleeve_position_repository.create_position(
-                db, sleeve.id, sym, shares=Decimal(str(real_qty))
+                db, sleeve.id, sym, shares=Decimal(str(real_qty)), weight=weight
             )
-            changes.append({"symbol": sym, "action": "created", "old_qty": 0.0, "new_qty": real_qty})
+            changes.append({
+                "symbol": sym,
+                "action": "created",
+                "old_qty": 0.0,
+                "new_qty": real_qty,
+                "weight": float(weight),
+            })
 
         await db.commit()
 

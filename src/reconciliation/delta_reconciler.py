@@ -25,6 +25,20 @@ from src.db.session import get_db_context
 
 logger = structlog.get_logger(__name__)
 
+# Placeholder old_weight used when a ledger position has no recorded weight and
+# the provider has dropped the symbol. The value only has to be > 0 so the change
+# classifies as an "exit"; the sell quantity always comes from the ledger shares.
+UNKNOWN_EXIT_WEIGHT = Decimal(1)
+
+
+class EmptyTargetsError(Exception):
+    """Raised when a provider returns no target positions at all.
+
+    An empty target set is indistinguishable from "the scrape failed while
+    still exiting 0", so we refuse to act on it rather than proposing a full
+    liquidation of the sleeve.
+    """
+
 
 @dataclass
 class WeightChange:
@@ -63,6 +77,7 @@ class DeltaReconciliationResult:
     total_buy: Decimal
     total_sell: Decimal
     error: str | None = None
+    empty_targets: bool = False
 
 
 class DeltaReconciler:
@@ -100,6 +115,13 @@ class DeltaReconciler:
         log = logger.bind(sleeve_id=str(sleeve_id), symbols=list(new_weights.keys()))
 
         try:
+            if not new_weights:
+                raise EmptyTargetsError(
+                    "Provider returned zero target positions. Refusing to "
+                    "reconcile — an empty target set would propose exiting every "
+                    "position in the sleeve. Check the scraper's authentication."
+                )
+
             async with get_db_context() as db:
                 # Get current positions from virtual ledger
                 current_positions = await sleeve_position_repository.get_position_map(
@@ -148,6 +170,18 @@ class DeltaReconciler:
                 total_sell=total_sell,
             )
 
+        except EmptyTargetsError as e:
+            log.error("delta_reconcile_empty_targets", error=str(e))
+            return DeltaReconciliationResult(
+                success=False,
+                trades=[],
+                weight_changes=[],
+                total_buy=Decimal(0),
+                total_sell=Decimal(0),
+                error=str(e),
+                empty_targets=True,
+            )
+
         except Exception as e:
             log.exception("delta_reconcile_failed", error=str(e))
             return DeltaReconciliationResult(
@@ -177,11 +211,27 @@ class DeltaReconciler:
                 old_weight = Decimal(0)
             elif current_pos.weight is not None:
                 old_weight = current_pos.weight
-            else:
-                # Position exists but weight metadata is missing (e.g. recovered
-                # from RH via admin sync). Assume already at target so we don't
-                # propose to re-enter a position the user already holds.
+            elif symbol in new_weights:
+                # Weight metadata is missing (e.g. recovered from RH via admin
+                # sync) but the provider still holds the symbol. Assume it is
+                # already at target so we don't re-enter a position we own.
+                logger.warning(
+                    "ledger_position_missing_weight",
+                    symbol=symbol,
+                    action="assumed_at_target",
+                )
                 old_weight = new_weight
+            else:
+                # Weight metadata is missing AND the provider has dropped the
+                # symbol. This is an exit. Previously old_weight was set to
+                # new_weight (0), which classified as "unchanged" and silently
+                # swallowed the sell.
+                logger.warning(
+                    "ledger_position_missing_weight",
+                    symbol=symbol,
+                    action="treated_as_exit",
+                )
+                old_weight = UNKNOWN_EXIT_WEIGHT
 
             # Determine action
             if old_weight == 0 and new_weight > 0:

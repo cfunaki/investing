@@ -39,6 +39,25 @@ export async function extractActiveTrades(page: Page): Promise<ActiveTradesResul
   console.log('Navigating to research page...');
   await page.goto(RESEARCH_URL, { waitUntil: 'networkidle' });
 
+  // Verify we are actually logged in. A dead session renders the public page,
+  // where the ratings table simply isn't present — indistinguishable from
+  // "Bravos holds nothing" unless we check explicitly.
+  const landedUrl = page.url();
+  if (/\/(login|sign-in|wp-login|my-account)/i.test(landedUrl)) {
+    throw new Error(
+      `Not logged in to Bravos: redirected to ${landedUrl}. ` +
+        `Re-run 'npm run init-session' to refresh the session.`
+    );
+  }
+
+  const ratingsTable = await page.$('.asset-ratings');
+  if (!ratingsTable) {
+    throw new Error(
+      `Active Trades table (.asset-ratings) not found at ${landedUrl}. ` +
+        `The session is probably logged out, or the page markup changed.`
+    );
+  }
+
   // Get last updated date
   const lastUpdatedEl = await page.$('.dash-newsletter .date');
   const lastUpdatedText = lastUpdatedEl
@@ -90,6 +109,15 @@ export async function extractActiveTrades(page: Page): Promise<ActiveTradesResul
   }
 
   const totalWeight = trades.reduce((sum, t) => sum + t.weight, 0);
+
+  // The Active Trades table is never legitimately empty. Zero rows means the
+  // scrape failed — never report that as a successful empty portfolio.
+  if (trades.length === 0) {
+    throw new Error(
+      `Active Trades table present but yielded 0 rows at ${landedUrl}. ` +
+        `Session may be logged out or row selectors changed.`
+    );
+  }
 
   console.log(`Extracted ${trades.length} active trades with total weight ${totalWeight}`);
 

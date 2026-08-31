@@ -35,6 +35,7 @@ from src.reconciliation.delta_reconciler import (
     get_delta_reconciler,
     parse_bravos_weights,
 )
+from src.reconciliation.trade_mapping import delta_trade_to_proposed
 from src.db.repositories.signal_repository import signal_repository
 from src.signals.bravos_detector import BravosEmailDetector, get_bravos_detector
 from src.signals.models import (
@@ -421,6 +422,11 @@ class BravosSignalProcessor:
         )
 
         if not delta_result.success:
+            if delta_result.empty_targets:
+                # The scrape came back with zero positions. That is almost
+                # always a dead session rather than Bravos genuinely holding
+                # nothing, so alert loudly instead of failing quietly.
+                await self._alert_empty_scrape(log, len(new_weights))
             return BravosProcessingResult(
                 success=False,
                 new_email=True if email else False,
@@ -478,15 +484,7 @@ class BravosSignalProcessor:
 
         # Convert delta trades to ProposedTrade format
         proposed_trades = [
-            ProposedTrade(
-                symbol=t.symbol,
-                side=t.side,
-                notional=float(t.notional),
-                quantity=float(t.quantity) if t.quantity else None,
-                rationale=t.rationale,
-                proposal_price=proposal_prices.get(t.symbol),
-                bravos_entry_price=bravos_entry_prices.get(t.symbol),
-            )
+            delta_trade_to_proposed(t, proposal_prices, bravos_entry_prices)
             for t in delta_result.trades
         ]
 
@@ -524,6 +522,23 @@ class BravosSignalProcessor:
             total_sell=total_sell,
             approval_sent=approval_sent,
         )
+
+    async def _alert_empty_scrape(self, log, symbol_count: int) -> None:
+        """Notify on Telegram that the Bravos scrape returned no positions."""
+        try:
+            from src.approval.telegram import get_telegram_bot
+
+            bot = get_telegram_bot()
+            await bot.send_notification(
+                "*Bravos scrape returned no positions*\n\n"
+                f"Parsed {symbol_count} active trades from the scrape.\n"
+                "No trades were proposed — reconciling against an empty target "
+                "set would exit every position in the sleeve.\n\n"
+                "This usually means the Bravos session is logged out. "
+                "Re-run `npm run init-session` and re-upload the session."
+            )
+        except Exception as e:
+            log.warning("empty_scrape_alert_failed", error=str(e))
 
     async def _send_approval_request(
         self,

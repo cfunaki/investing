@@ -687,9 +687,19 @@ class ApprovalWorkflow:
                     if weight < 0:
                         weight = abs(weight)
 
+                    # target_weight must be present. A missing or zero value on a
+                    # buy used to write weight=NULL into the ledger, which made
+                    # the position permanently invisible to reconciliation.
+                    has_target = trade.get("target_weight") is not None
+                    target_weight = Decimal(str(trade.get("target_weight", 0)))
+
                     if side == "buy":
-                        # For new positions, weight is the target weight
-                        target_weight = Decimal(str(trade.get("target_weight", weight)))
+                        if target_weight <= 0:
+                            log.error(
+                                "buy_missing_target_weight",
+                                symbol=symbol,
+                                trade=trade,
+                            )
                         await sleeve_position_repository.add_shares(
                             db,
                             sleeve_id=sleeve_id,
@@ -701,8 +711,32 @@ class ApprovalWorkflow:
                         log.info("ledger_added_shares", symbol=symbol, shares=float(shares))
 
                     elif side == "sell":
-                        # Check if this is a full exit (weight going to 0)
-                        new_weight = Decimal(str(trade.get("target_weight", 0)))
+                        # A full exit is target_weight == 0 *explicitly stated*.
+                        # If the key is absent we cannot tell an exit from a trim,
+                        # so fall back to comparing shares against the ledger and
+                        # only delete when the whole position is being sold.
+                        new_weight = target_weight
+                        if not has_target:
+                            existing = await sleeve_position_repository.get_position(
+                                db, sleeve_id, symbol
+                            )
+                            fully_sold = existing is None or shares >= existing.shares
+                            log.warning(
+                                "sell_missing_target_weight",
+                                symbol=symbol,
+                                inferred_full_exit=fully_sold,
+                            )
+                            if not fully_sold:
+                                # Treat as a trim; leave the weight untouched.
+                                await sleeve_position_repository.remove_shares(
+                                    db, sleeve_id, symbol, shares
+                                )
+                                log.info(
+                                    "ledger_removed_shares",
+                                    symbol=symbol,
+                                    shares=float(shares),
+                                )
+                                continue
                         if new_weight == 0:
                             # Full exit - delete position
                             await sleeve_position_repository.delete_position(
