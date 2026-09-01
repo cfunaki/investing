@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { config } from 'dotenv';
 import { isLoggedIn, waitForLogin } from './login-detector.js';
+import { hasAuthCookie, authCookieNames } from './auth-cookie.js';
 
 // Load environment variables
 config();
@@ -40,6 +41,16 @@ export function loadStorageState(): object | undefined {
  * Save current session state to disk
  */
 export async function saveStorageState(context: BrowserContext): Promise<void> {
+  // Refuse to persist a logged-out session. The browser worker uploads this
+  // file to GCS after every scrape, so saving a logged-out state overwrites a
+  // good session and makes the failure self-perpetuating.
+  if (!(await hasAuthCookie(context))) {
+    throw new Error(
+      'Refusing to save session: no WordPress auth cookie present. ' +
+        'The browser is not logged in to Bravos.'
+    );
+  }
+
   const dir = dirname(SESSION_PATH);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -49,6 +60,7 @@ export async function saveStorageState(context: BrowserContext): Promise<void> {
   writeFileSync(SESSION_PATH, JSON.stringify(state, null, 2));
   console.log(`Session saved to ${SESSION_PATH}`);
 }
+
 
 /**
  * Perform automated login using credentials from .env
@@ -191,35 +203,21 @@ async function performAutomatedLogin(page: Page): Promise<boolean> {
     await page.waitForLoadState('networkidle');
     await page.waitForTimeout(2000);
 
-    const ideasUrl = page.url();
-    console.log(`Ideas page URL: ${ideasUrl}`);
-
-    // Take screenshot of ideas page
+    console.log(`Ideas page URL: ${page.url()}`);
     await page.screenshot({ path: 'data/raw/debug-ideas-logged-in.png', fullPage: true });
-    console.log('Ideas page screenshot saved to data/raw/debug-ideas-logged-in.png');
 
-    // Check if we can see actual ideas content (vs paywall)
-    const hasPaywall = await page.$('h1:has-text("Memberships")');
-    if (hasPaywall) {
-      console.log('WARNING: Ideas page shows membership paywall');
-      return false;
-    }
-
-    // Check for actual ideas content
-    const hasIdeasContent = await page.$('article, .idea, .trade, .post, table');
-    if (hasIdeasContent) {
-      console.log('Found ideas content - login successful!');
+    // Authoritative check: the WordPress auth cookie. DOM content is not
+    // evidence of login — the public page renders articles and account links
+    // too, which is what made this report success while logged out.
+    const loggedIn = await hasAuthCookie(page.context());
+    if (loggedIn) {
+      console.log(
+        `Login verified via auth cookie: ${(await authCookieNames(page.context())).join(', ')}`
+      );
       return true;
     }
 
-    // Check if logged in by looking for logout link
-    const hasLogout = await page.$('a[href*="logout"], a:has-text("Log Out"), a:has-text("Sign Out")');
-    if (hasLogout) {
-      console.log('Found logout link - logged in but may need subscription');
-      return true;
-    }
-
-    console.log('Could not verify login status');
+    console.log('No WordPress auth cookie present - automated login did NOT succeed.');
     return false;
 
   } catch (e) {
