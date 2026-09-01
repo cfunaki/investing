@@ -74,131 +74,94 @@ async function performAutomatedLogin(page: Page): Promise<boolean> {
   console.log(`Attempting automated login as ${BRAVOS_USERNAME}...`);
 
   try {
-    // Fill form via JavaScript to bypass viewport issues
-    console.log('Filling login form via JavaScript...');
-
-    const formFilled = await page.evaluate(({ username, password }) => {
-      // Find username field
-      const usernameInput = document.querySelector<HTMLInputElement>(
-        'input[name="email"], input[name="username"], input[type="email"], input#email, input#username'
-      );
-      if (!usernameInput) {
-        console.error('Username field not found');
-        return { success: false, error: 'Username field not found' };
-      }
-
-      // Find password field
-      const passwordInput = document.querySelector<HTMLInputElement>(
-        'input[name="password"], input[type="password"], input#password'
-      );
-      if (!passwordInput) {
-        console.error('Password field not found');
-        return { success: false, error: 'Password field not found' };
-      }
-
-      // Fill the fields
-      usernameInput.value = username;
-      usernameInput.dispatchEvent(new Event('input', { bubbles: true }));
-      usernameInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-      passwordInput.value = password;
-      passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
-      passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-      // Check "Remember me" if present
-      const rememberMe = document.querySelector<HTMLInputElement>(
-        'input[type="checkbox"]#rememberme, input[name="rememberme"], input[type="checkbox"][name*="remember"]'
-      );
-      if (rememberMe && !rememberMe.checked) {
-        rememberMe.checked = true;
-        rememberMe.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-
-      return { success: true, usernameValue: usernameInput.value, hasRememberMe: !!rememberMe };
-    }, { username: BRAVOS_USERNAME, password: BRAVOS_PASSWORD });
-
-    console.log('Form fill result:', formFilled);
-
-    if (!formFilled.success) {
-      console.log(`Form fill failed: ${formFilled.error}`);
+    // Scope everything to the real login form. The previous implementation
+    // used document.querySelector across the whole page with a comma-separated
+    // selector list, which returns the first match in DOCUMENT order — on this
+    // page that can be a newsletter/subscribe email input rather than the
+    // login field, so the credentials were typed into the wrong box.
+    let form = page.locator('form.woocommerce-form-login').first();
+    if ((await form.count()) === 0) {
+      // Fall back to whichever form actually contains a password input.
+      form = page.locator('form:has(input[type="password"])').first();
+    }
+    if ((await form.count()) === 0) {
+      console.log('No login form found on page');
       return false;
     }
 
-    // Wait a moment for form to be ready
-    await page.waitForTimeout(500);
+    const userField = form.locator(
+      'input[name="username"], input[name="log"], input[name="email"]'
+    ).first();
+    const passField = form.locator('input[type="password"]').first();
 
-    // Debug: Take screenshot before submission
-    await page.screenshot({ path: 'data/raw/debug-before-submit.png', fullPage: true });
-    console.log('Screenshot before submit saved');
+    if ((await userField.count()) === 0 || (await passField.count()) === 0) {
+      console.log('Login form found but username/password inputs are missing');
+      return false;
+    }
 
-    // Submit form via JavaScript
-    console.log('Submitting login form via JavaScript...');
-    await page.evaluate(() => {
-      const form = document.querySelector('form.woocommerce-form-login, form.login, form#loginform, form');
-      if (form) {
-        // Try clicking the submit button first
-        const submitBtn = form.querySelector<HTMLButtonElement>('button[type="submit"], input[type="submit"], button:not([type])');
-        if (submitBtn) {
-          submitBtn.click();
-        } else {
-          // Fallback to form submit
-          (form as HTMLFormElement).submit();
-        }
-      }
-    });
+    // Native fill dispatches real key/input events and respects the field's
+    // own handlers, unlike assigning .value from injected JS.
+    await userField.fill(BRAVOS_USERNAME);
+    await passField.fill(BRAVOS_PASSWORD);
 
-    // Wait for navigation to complete
-    console.log('Waiting for navigation...');
+    // Tick "Remember me" so WordPress issues a ~14-day cookie instead of ~2-day.
+    // Set it at the DOM level: this page's layout makes Playwright report every
+    // control as "outside of the viewport", so .check() — even with force —
+    // throws. Never let this step block the login.
     try {
-      await Promise.race([
-        page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }),
-        page.waitForTimeout(15000)
-      ]);
+      const remember = form.locator('input[type="checkbox"][name*="remember" i]').first();
+      if ((await remember.count()) > 0) {
+        await remember.evaluate((el) => {
+          const box = el as HTMLInputElement;
+          if (!box.checked) {
+            box.checked = true;
+            box.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+        console.log('Checked "Remember me" (extends the session to ~14 days)');
+      }
     } catch (e) {
-      console.log('Navigation wait completed (or timed out)');
+      console.log(`Could not tick "Remember me" (continuing): ${(e as Error).message.split('\n')[0]}`);
     }
 
-    // Wait additional time for any AJAX/SPA updates
-    await page.waitForTimeout(3000);
-    console.log(`After wait, URL is: ${page.url()}`);
+    console.log(`Filled login form. username field value: "${await userField.inputValue()}"`);
 
-    // Check page content to debug
-    const pageTitle = await page.title();
-    console.log(`Page title: ${pageTitle}`);
+    // Submit at the DOM level via requestSubmit(). Every control on this page
+    // reports as "outside of the viewport" to Playwright — .click() (even with
+    // force) and Enter both fail — but requestSubmit() involves no geometry and,
+    // unlike form.submit(), passes the submit button as the submitter so
+    // WooCommerce still receives the $_POST['login'] field process_login()
+    // requires.
+    const how = await form.evaluate((f) => {
+      const el = f as HTMLFormElement;
+      const btn = el.querySelector<HTMLElement>(
+        'button[name="login"], button[type="submit"], input[type="submit"]'
+      );
+      if (typeof el.requestSubmit === 'function') {
+        el.requestSubmit((btn as HTMLElement | null) ?? undefined);
+        return 'requestSubmit';
+      }
+      if (btn) {
+        btn.click();
+        return 'buttonClick';
+      }
+      el.submit();
+      return 'formSubmit';
+    });
+    console.log(`Submitted login form via ${how}`);
 
-    // Check for any error messages on the page
-    const errorMessage = await page.$('.error, .alert-error, .login-error, .woocommerce-error');
-    if (errorMessage) {
-      const errorText = await errorMessage.textContent();
-      console.log(`Error on page: ${errorText}`);
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await page.waitForTimeout(2500);
+
+    // Surface whatever WooCommerce said, rather than guessing from the DOM.
+    const errorEl = page.locator('.woocommerce-error, .woocommerce-error li').first();
+    if ((await errorEl.count()) > 0) {
+      const text = (await errorEl.innerText().catch(() => '')).trim();
+      if (text) {
+        console.log(`Site reported: ${text.replace(/\s+/g, ' ').slice(0, 200)}`);
+      }
     }
 
-    // Log visible elements to help debug
-    const visibleLoginForm = await page.$('form.login, form#loginform, .woocommerce-form-login');
-    if (visibleLoginForm) {
-      console.log('Login form still visible - login may have failed');
-    }
-
-    const logoutLink = await page.$('a[href*="logout"]');
-    if (logoutLink) {
-      console.log('Found logout link - we ARE logged in!');
-    }
-
-    const currentUrl = page.url();
-    console.log(`Current URL after login: ${currentUrl}`);
-
-    // Take debug screenshot
-    await page.screenshot({ path: 'data/raw/debug-after-login.png', fullPage: true });
-    console.log('Debug screenshot saved to data/raw/debug-after-login.png');
-
-    // Check if we're still on login page
-    if (currentUrl.includes('/login')) {
-      console.log('Still on login page - login may have failed');
-      return false;
-    }
-
-    // We're redirected - navigate to ideas page to verify access
-    console.log('Login appears successful, checking /ideas/ access...');
     await page.goto('https://bravosresearch.com/ideas/', { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle');
     await page.waitForTimeout(2000);

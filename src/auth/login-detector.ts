@@ -3,7 +3,7 @@ import { pageHasAuthCookie } from './auth-cookie.js';
 
 const BRAVOS_IDEAS_URL = 'https://bravosresearch.com/ideas/';
 const LOGIN_PAGE_PATTERNS = ['/login', '/signin', '/auth'];
-const MAX_WAIT_MS = 5 * 60 * 1000;  // 5 minutes max wait for login
+const MAX_WAIT_MS = 10 * 60 * 1000;  // 10 minutes max wait for manual login
 const CHECK_INTERVAL_MS = 1000;      // Check every second
 
 /**
