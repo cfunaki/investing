@@ -225,22 +225,49 @@ class GmailMonitor:
             return None
 
     def _persist_refreshed_token(self, creds) -> None:
-        """Write refreshed Gmail token to Secret Manager and database."""
+        """Write refreshed Gmail token to Secret Manager and database.
+
+        Secret Manager is written ONLY when the refresh_token has actually
+        rotated. Access tokens expire hourly, so writing on every refresh added
+        ~720 secret versions per month; at $0.06 per active version per month
+        that reached $42/month and compounded, since versions are billed for as
+        long as they exist and nothing ever removed them.
+
+        The refresh_token is the only part Secret Manager needs to carry — it is
+        what bootstraps a cold Cloud Run instance. Everything else lives in the
+        database copy written below.
+        """
         token_json = creds.to_json()
 
-        # 1. Try Secret Manager
+        # 1. Secret Manager — only on refresh_token rotation
         try:
             from google.cloud import secretmanager
-            client = secretmanager.SecretManagerServiceClient()
-            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "investing-automation-490206")
-            secret_path = f"projects/{project_id}/secrets/GMAIL_TOKEN_JSON"
-            client.add_secret_version(
-                request={
-                    "parent": secret_path,
-                    "payload": {"data": token_json.encode("utf-8")},
-                }
-            )
-            logger.info("gmail_token_persisted_to_secret_manager")
+
+            new_refresh = getattr(creds, "refresh_token", None)
+            stored_refresh = None
+            stored = self._load_latest_token_from_secret_manager()
+            if stored:
+                try:
+                    stored_refresh = json.loads(stored).get("refresh_token")
+                except (ValueError, TypeError):
+                    stored_refresh = None
+
+            if new_refresh and new_refresh != stored_refresh:
+                client = secretmanager.SecretManagerServiceClient()
+                project_id = os.environ.get(
+                    "GOOGLE_CLOUD_PROJECT", "investing-automation-490206"
+                )
+                secret_path = f"projects/{project_id}/secrets/GMAIL_TOKEN_JSON"
+                client.add_secret_version(
+                    request={
+                        "parent": secret_path,
+                        "payload": {"data": token_json.encode("utf-8")},
+                    }
+                )
+                logger.info("gmail_token_persisted_to_secret_manager", reason="refresh_token_rotated")
+                self._prune_secret_versions(client, secret_path)
+            else:
+                logger.debug("gmail_token_secret_manager_write_skipped", reason="refresh_token_unchanged")
         except Exception as e:
             logger.warning("gmail_token_secret_manager_write_failed", error=str(e))
 
@@ -266,6 +293,30 @@ class GmailMonitor:
             logger.info("gmail_token_persisted_to_database")
         except Exception as e:
             logger.warning("gmail_token_database_write_failed", error=str(e))
+
+    @staticmethod
+    def _prune_secret_versions(client, secret_path: str, keep: int = 5) -> None:
+        """Destroy all but the newest `keep` enabled versions of a secret.
+
+        Backstop against re-accumulation: every enabled version bills
+        $0.06/month for as long as it exists, so an unbounded version history
+        is an unbounded bill. Safe because every consumer binds to `latest`.
+        """
+        try:
+            versions = [
+                v for v in client.list_secret_versions(request={"parent": secret_path})
+                if v.state.name == "ENABLED"
+            ]
+            # list_secret_versions returns newest first; keep that many, drop the rest.
+            for v in versions[keep:]:
+                try:
+                    client.destroy_secret_version(request={"name": v.name})
+                except Exception as e:
+                    logger.warning("secret_version_destroy_failed", version=v.name, error=str(e))
+            if len(versions) > keep:
+                logger.info("secret_versions_pruned", destroyed=len(versions) - keep, kept=keep)
+        except Exception as e:
+            logger.warning("secret_version_prune_failed", error=str(e))
 
     def _get_service(self):
         """Get Gmail API service (lazy initialization)."""
