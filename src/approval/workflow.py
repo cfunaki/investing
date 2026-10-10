@@ -662,98 +662,110 @@ class ApprovalWorkflow:
         try:
             async with get_db_context() as db:
                 for trade in proposed_trades:
-                    symbol = trade.get("symbol", "").upper()
-                    side = trade.get("side", "").lower()
-                    notional = Decimal(str(trade.get("notional", 0)))
+                    try:
+                        symbol = trade.get("symbol", "").upper()
+                        side = trade.get("side", "").lower()
+                        notional = Decimal(str(trade.get("notional", 0)))
 
-                    # Find the matching execution result
-                    exec_result = next(
-                        (r for r in execution_report.results
-                         if r.symbol == symbol and r.success),
-                        None
-                    )
-
-                    if not exec_result:
-                        log.warning("no_execution_result_for_trade", symbol=symbol)
-                        continue
-
-                    # Get shares from execution result or estimate from notional
-                    shares = Decimal(str(exec_result.quantity or 0))
-                    if shares == 0 and exec_result.fill_price:
-                        shares = notional / Decimal(str(exec_result.fill_price))
-
-                    # Get weight from trade data
-                    weight = Decimal(str(trade.get("weight_delta", 0)))
-                    if weight < 0:
-                        weight = abs(weight)
-
-                    # target_weight must be present. A missing or zero value on a
-                    # buy used to write weight=NULL into the ledger, which made
-                    # the position permanently invisible to reconciliation.
-                    has_target = trade.get("target_weight") is not None
-                    target_weight = Decimal(str(trade.get("target_weight", 0)))
-
-                    if side == "buy":
-                        if target_weight <= 0:
-                            log.error(
-                                "buy_missing_target_weight",
-                                symbol=symbol,
-                                trade=trade,
-                            )
-                        await sleeve_position_repository.add_shares(
-                            db,
-                            sleeve_id=sleeve_id,
-                            symbol=symbol,
-                            shares_delta=shares,
-                            weight=target_weight if target_weight > 0 else None,
-                            cost_delta=notional,
+                        # Find the matching execution result
+                        exec_result = next(
+                            (r for r in execution_report.results
+                             if r.symbol == symbol and r.success),
+                            None
                         )
-                        log.info("ledger_added_shares", symbol=symbol, shares=float(shares))
 
-                    elif side == "sell":
-                        # A full exit is target_weight == 0 *explicitly stated*.
-                        # If the key is absent we cannot tell an exit from a trim,
-                        # so fall back to comparing shares against the ledger and
-                        # only delete when the whole position is being sold.
-                        new_weight = target_weight
-                        if not has_target:
-                            existing = await sleeve_position_repository.get_position(
-                                db, sleeve_id, symbol
-                            )
-                            fully_sold = existing is None or shares >= existing.shares
-                            log.warning(
-                                "sell_missing_target_weight",
+                        if not exec_result:
+                            log.warning("no_execution_result_for_trade", symbol=symbol)
+                            continue
+
+                        # Get shares from execution result or estimate from notional.
+                        # NOTE (2026-10-10): TradeResult exposes filled_quantity /
+                        # filled_price, not quantity / fill_price. The old names
+                        # raised AttributeError on every run, which aborted the
+                        # whole loop before commit — the ledger never updated and
+                        # every buy was re-proposed (duplicate-buy bug).
+                        filled_qty = getattr(exec_result, "filled_quantity", 0) or 0
+                        shares = Decimal(str(filled_qty))
+                        if shares == 0:
+                            filled_price = getattr(exec_result, "filled_price", None)
+                            if filled_price:
+                                shares = notional / Decimal(str(filled_price))
+
+                        # Get weight from trade data
+                        weight = Decimal(str(trade.get("weight_delta", 0)))
+                        if weight < 0:
+                            weight = abs(weight)
+
+                        # target_weight must be present. A missing or zero value on a
+                        # buy used to write weight=NULL into the ledger, which made
+                        # the position permanently invisible to reconciliation.
+                        has_target = trade.get("target_weight") is not None
+                        target_weight = Decimal(str(trade.get("target_weight", 0)))
+
+                        if side == "buy":
+                            if target_weight <= 0:
+                                log.error(
+                                    "buy_missing_target_weight",
+                                    symbol=symbol,
+                                    trade=trade,
+                                )
+                            await sleeve_position_repository.add_shares(
+                                db,
+                                sleeve_id=sleeve_id,
                                 symbol=symbol,
-                                inferred_full_exit=fully_sold,
+                                shares_delta=shares,
+                                weight=target_weight if target_weight > 0 else None,
+                                cost_delta=notional,
                             )
-                            if not fully_sold:
-                                # Treat as a trim; leave the weight untouched.
-                                await sleeve_position_repository.remove_shares(
+                            log.info("ledger_added_shares", symbol=symbol, shares=float(shares))
+
+                        elif side == "sell":
+                            # A full exit is target_weight == 0 *explicitly stated*.
+                            # If the key is absent we cannot tell an exit from a trim,
+                            # so fall back to comparing shares against the ledger and
+                            # only delete when the whole position is being sold.
+                            new_weight = target_weight
+                            if not has_target:
+                                existing = await sleeve_position_repository.get_position(
+                                    db, sleeve_id, symbol
+                                )
+                                fully_sold = existing is None or shares >= existing.shares
+                                log.warning(
+                                    "sell_missing_target_weight",
+                                    symbol=symbol,
+                                    inferred_full_exit=fully_sold,
+                                )
+                                if not fully_sold:
+                                    # Treat as a trim; leave the weight untouched.
+                                    await sleeve_position_repository.remove_shares(
+                                        db, sleeve_id, symbol, shares
+                                    )
+                                    log.info(
+                                        "ledger_removed_shares",
+                                        symbol=symbol,
+                                        shares=float(shares),
+                                    )
+                                    continue
+                            if new_weight == 0:
+                                # Full exit - delete position
+                                await sleeve_position_repository.delete_position(
+                                    db, sleeve_id, symbol
+                                )
+                                log.info("ledger_deleted_position", symbol=symbol)
+                            else:
+                                # Partial sell - reduce shares
+                                result = await sleeve_position_repository.remove_shares(
                                     db, sleeve_id, symbol, shares
                                 )
-                                log.info(
-                                    "ledger_removed_shares",
-                                    symbol=symbol,
-                                    shares=float(shares),
-                                )
-                                continue
-                        if new_weight == 0:
-                            # Full exit - delete position
-                            await sleeve_position_repository.delete_position(
-                                db, sleeve_id, symbol
-                            )
-                            log.info("ledger_deleted_position", symbol=symbol)
-                        else:
-                            # Partial sell - reduce shares
-                            result = await sleeve_position_repository.remove_shares(
-                                db, sleeve_id, symbol, shares
-                            )
-                            if result:
-                                await sleeve_position_repository.update_position(
-                                    db, result, weight=new_weight
-                                )
-                            log.info("ledger_removed_shares", symbol=symbol, shares=float(shares))
+                                if result:
+                                    await sleeve_position_repository.update_position(
+                                        db, result, weight=new_weight
+                                    )
+                                log.info("ledger_removed_shares", symbol=symbol, shares=float(shares))
 
+                    except Exception as e:
+                        log.exception("ledger_trade_failed", symbol=trade.get("symbol", "?"), error=str(e))
+                        continue
                 await db.commit()
                 log.info("ledger_update_complete")
 

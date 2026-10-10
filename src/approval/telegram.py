@@ -199,10 +199,15 @@ class TelegramBot:
                 qty = trade.get("quantity")
                 notional = abs(trade.get("notional", 0))
                 if qty and notional == 0:
-                    # Sells use quantity; display dollar value from price × qty
+                    # Sells use quantity; display dollar value from price × qty.
+                    # If the price lookup failed, show the share count instead
+                    # of a misleading -$0 (this hid phantom sells for weeks).
                     price = trade.get("proposal_price", 0) or 0
                     est_value = price * qty
-                    line = f"  {symbol}  -${est_value:,.0f}"
+                    if est_value > 0:
+                        line = f"  {symbol}  -${est_value:,.0f}"
+                    else:
+                        line = f"  {symbol}  -{qty:g} sh (price n/a)"
                 else:
                     line = f"  {symbol}  -${notional:,.0f}"
                 line += self._format_price_context(trade)
@@ -1512,13 +1517,18 @@ class TelegramBot:
             await self._application.stop()
             await self._application.shutdown()
 
-    async def setup_webhook(self, webhook_url: str) -> bool:
+    async def setup_webhook(
+        self, webhook_url: str, secret_token: str | None = None
+    ) -> bool:
         """
         Set up Telegram webhook for receiving updates.
 
         Args:
             webhook_url: Public HTTPS URL for the webhook endpoint
                         (e.g., https://your-service.run.app/webhooks/telegram)
+            secret_token: Optional secret; Telegram sends it back as the
+                        X-Telegram-Bot-Api-Secret-Token header on every update,
+                        which AuthMiddleware validates.
 
         Returns:
             True if webhook was set successfully
@@ -1532,10 +1542,13 @@ class TelegramBot:
             await bot.delete_webhook(drop_pending_updates=True)
 
             # Set the new webhook
-            result = await bot.set_webhook(
-                url=webhook_url,
-                allowed_updates=["message", "callback_query"],
-            )
+            kwargs: dict[str, Any] = {
+                "url": webhook_url,
+                "allowed_updates": ["message", "callback_query"],
+            }
+            if secret_token:
+                kwargs["secret_token"] = secret_token
+            result = await bot.set_webhook(**kwargs)
 
             if result:
                 log.info("telegram_webhook_set")
