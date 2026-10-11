@@ -18,6 +18,7 @@ from uuid import UUID
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1538,17 +1539,36 @@ class TelegramBot:
         try:
             bot = self.application.bot
 
-            # Delete any existing webhook first
-            await bot.delete_webhook(drop_pending_updates=True)
-
-            # Set the new webhook
+            # set_webhook replaces any existing webhook atomically. Do NOT
+            # delete first: every instance runs this on startup, and a
+            # delete racing another instance's set (followed by a 429 on our
+            # own set) left no webhook registered on 2026-10-11. Deleting
+            # with drop_pending_updates also discarded unanswered taps.
             kwargs: dict[str, Any] = {
                 "url": webhook_url,
                 "allowed_updates": ["message", "callback_query"],
             }
             if secret_token:
                 kwargs["secret_token"] = secret_token
-            result = await bot.set_webhook(**kwargs)
+
+            for attempt in range(3):
+                try:
+                    result = await bot.set_webhook(**kwargs)
+                    break
+                except RetryAfter as e:
+                    ra = e.retry_after
+                    wait = ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)
+                    log.warning("telegram_webhook_flood_control", retry_after=wait, attempt=attempt + 1)
+                    await asyncio.sleep(min(wait, 5) + 0.5)
+            else:
+                # Concurrent instances set the same URL; if one of them won,
+                # the webhook is in place and this instance is fine.
+                info = await bot.get_webhook_info()
+                if info.url == webhook_url:
+                    log.info("telegram_webhook_already_set_by_peer")
+                    return True
+                log.error("telegram_webhook_failed_flood_control")
+                return False
 
             if result:
                 log.info("telegram_webhook_set")
