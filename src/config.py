@@ -81,6 +81,52 @@ class Settings(BaseSettings):
         default=None,
         description="Public URL for Telegram webhook (e.g., https://your-service.run.app/webhooks/telegram)",
     )
+    telegram_webhook_secret: Optional[str] = Field(
+        default=None,
+        description=(
+            "Secret token for Telegram webhook validation "
+            "(X-Telegram-Bot-Api-Secret-Token header). Set via set_webhook secret_token."
+        ),
+    )
+
+    # =========================================================================
+    # API Authentication
+    # =========================================================================
+    api_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Admin API key, sent as X-API-Key header. Required in production; "
+            "without it all /admin, /trigger, /debug and /jobs routes are denied."
+        ),
+    )
+    ai_api_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Scoped API key for the external AI assistant (X-API-Key header). "
+            "May only read positions/sleeves and submit custom buys/sells. "
+            "No approval execution, no config changes."
+        ),
+    )
+    ai_max_requests_per_hour: int = Field(
+        default=30,
+        description="Rate limit for the AI key (requests per rolling hour).",
+        ge=1,
+        le=1000,
+    )
+    ai_max_daily_notional: float = Field(
+        default=50000.0,
+        description="Max total notional the AI key may submit per day (USD).",
+        ge=1000.0,
+    )
+    tactical_sleeve_max_pct: float = Field(
+        default=0.10,
+        description=(
+            "Max size of the 'tactical' sleeve as a fraction of portfolio net "
+            "equity (0.10 = 10%). Enforced on custom buy/sell submissions."
+        ),
+        ge=0.01,
+        le=0.50,
+    )
 
     @field_validator("telegram_allowed_users", mode="before")
     @classmethod

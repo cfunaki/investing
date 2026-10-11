@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import structlog
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -61,9 +61,14 @@ async def lifespan(app: FastAPI):
         await bot.application.start()
         logger.info("Telegram bot started for webhook mode")
 
-        # Set up webhook if URL is configured
+        # Set up webhook if URL is configured. The secret token (when set)
+        # makes Telegram send X-Telegram-Bot-Api-Secret-Token with every
+        # update, which AuthMiddleware validates.
         if config.telegram_webhook_url:
-            webhook_result = await bot.setup_webhook(config.telegram_webhook_url)
+            webhook_result = await bot.setup_webhook(
+                config.telegram_webhook_url,
+                secret_token=config.telegram_webhook_secret,
+            )
             if webhook_result:
                 logger.info(f"Telegram webhook configured: {config.telegram_webhook_url}")
             else:
@@ -139,6 +144,14 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# API-key auth. Added before CORS so CORS stays outermost and preflights
+# are not blocked by the key check. See src/api/auth.py for the scope model:
+#   X-API-Key: <API_KEY>    -> admin (all /admin, /trigger, /debug, /jobs)
+#   X-API-Key: <AI_API_KEY> -> ai (position reads + custom buy/sell submit only)
+from src.api.auth import AuthMiddleware
+
+app.add_middleware(AuthMiddleware)
 
 # CORS middleware (for potential future web UI)
 app.add_middleware(
@@ -350,122 +363,12 @@ async def telegram_webhook(request_body: dict[str, Any]):
 
 @app.post("/jobs/poll-email", response_model=JobResponse, tags=["Jobs"])
 async def job_poll_email(background_tasks: BackgroundTasks):
+    """Retired 2026-10-10: the Bravos signal pipeline is decommissioned.
+
+    The bravos sleeve is being wound down; no new Bravos signals will be
+    processed. See docs/DEPLOY-RETHINK.md.
     """
-    Scheduled job: Poll Gmail for new Bravos emails.
-
-    Called by Cloud Scheduler every 2-5 minutes.
-
-    This endpoint:
-    1. Polls Gmail for new Bravos emails
-    2. For each new email, triggers signal processing
-    3. Returns summary of what was found/processed
-    """
-    started_at = datetime.now(timezone.utc)
-    log = structlog.get_logger(__name__).bind(job="poll_email")
-
-    try:
-        log.info("starting_email_poll")
-
-        # Load already-processed message IDs from database
-        from src.signals.bravos_detector import get_bravos_detector
-        try:
-            detector = get_bravos_detector()
-            processed_ids = await detector.get_processed_message_ids()
-            log.info("loaded_processed_ids", count=len(processed_ids))
-        except Exception as e:
-            log.warning("failed_to_load_processed_ids", error=str(e))
-            processed_ids = set()
-
-        # Poll for new emails
-        emails = await poll_for_bravos_emails(processed_ids=processed_ids)
-
-        if not emails:
-            log.info("no_new_emails")
-            return JobResponse(
-                job="poll_email",
-                status="completed",
-                started_at=started_at.isoformat(),
-                completed_at=datetime.now(timezone.utc).isoformat(),
-                results={
-                    "emails_found": 0,
-                    "signals_created": 0,
-                },
-            )
-
-        # Process each email
-        processor = get_processor()
-        results = []
-        success_count = 0
-        error_count = 0
-
-        for email_data in emails:
-            message_id = email_data["message_id"]
-            payload = email_data["payload"]
-
-            log.info(
-                "processing_email",
-                message_id=message_id,
-                subject=payload.get("subject"),
-            )
-
-            try:
-                result = await processor.process_bravos_email(
-                    email_message_id=message_id,
-                    email_payload=payload,
-                )
-
-                if result.success:
-                    success_count += 1
-                    results.append({
-                        "message_id": message_id,
-                        "success": True,
-                        "signal_id": str(result.signal.id),
-                        "intent_id": str(result.intent.id) if result.intent else None,
-                    })
-                else:
-                    error_count += 1
-                    results.append({
-                        "message_id": message_id,
-                        "success": False,
-                        "error": result.error,
-                    })
-
-            except Exception as e:
-                error_count += 1
-                log.exception("email_processing_failed", message_id=message_id, error=str(e))
-                results.append({
-                    "message_id": message_id,
-                    "success": False,
-                    "error": str(e),
-                })
-
-        # Close processor
-        await processor.close()
-
-        log.info(
-            "email_poll_completed",
-            emails_found=len(emails),
-            success=success_count,
-            errors=error_count,
-        )
-
-        return JobResponse(
-            job="poll_email",
-            status="completed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            results={
-                "emails_found": len(emails),
-                "signals_created": success_count,
-                "errors": error_count,
-                "details": results,
-            },
-        )
-
-    except Exception as e:
-        log.exception("email_poll_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
+    raise HTTPException(status_code=410, detail="Bravos pipeline retired")
 
 @app.post("/jobs/reconcile", response_model=JobResponse, tags=["Jobs"])
 async def job_reconcile(sleeve: str = "bravos"):
@@ -1157,6 +1060,24 @@ async def admin_custom_sells(name: str, sells: dict[str, float]):
     symbols = list(sells.keys())
     quotes = await broker.get_quotes(symbols)
 
+    # Guardrail: never propose selling more shares than actually held.
+    # The stale ledger used to propose phantom sells that Robinhood rejected
+    # with "Not enough shares to sell" (8 of 18 trades on 2026-10-09).
+    live_positions = await broker.get_positions()
+    held = {p.symbol.upper(): float(p.quantity) for p in live_positions}
+    over = {}
+    for sym, qty in sells.items():
+        s = sym.upper()
+        q = float(qty)
+        h = held.get(s, 0.0)
+        if q > h + 1e-9:
+            over[s] = {"requested": q, "held": round(h, 6)}
+    if over:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "sell quantity exceeds shares held", "symbols": over},
+        )
+
     trades = []
     for sym, qty in sells.items():
         sym = sym.upper()
@@ -1227,6 +1148,173 @@ async def admin_custom_sells(name: str, sells: dict[str, float]):
         "approval_id": str(approval_id),
         "trade_count": len(trades),
         "estimated_proceeds": round(total_proceeds_est, 2),
+        "telegram_message_id": message_id,
+    }
+
+
+@app.post("/admin/sleeve/{name}/custom-buys", tags=["Admin"])
+async def admin_custom_buys(
+    name: str, buys: dict[str, float], request: Request
+):
+    """Body: {SYMBOL: dollars_to_buy, ...}. Creates one Approval combining
+    those buys and sends to Telegram.
+
+    Guardrails (each a lesson from the Oct 2026 incidents):
+    - Buys must fit inside current buying power: the account can never be
+      pushed cash-negative (this is what created the $13k margin debt).
+    - The 'tactical' sleeve is capped at tactical_sleeve_max_pct of portfolio
+      net equity (default 10%).
+    - Single buys larger than max_trade_notional are split into multiple
+      trades so the safety checker doesn't reject them at execution.
+    - The AI key's daily notional cap is enforced here.
+    """
+    from datetime import timedelta
+    from src.api.auth import ai_check_notional, ai_record_notional
+    from src.approval.telegram import (
+        ApprovalRequest,
+        generate_approval_code,
+        get_telegram_bot,
+    )
+    from src.approval.workflow import get_approval_workflow
+    from src.brokers.robinhood import get_robinhood_adapter
+    from src.config import get_settings
+    from src.db.repositories.approval_repository import approval_repository
+    from src.db.repositories.reconciliation_repository import reconciliation_repository
+    from src.db.repositories.sleeve_repository import sleeve_repository
+    import structlog
+
+    log = structlog.get_logger(__name__).bind(endpoint="admin_custom_buys")
+
+    if not buys:
+        raise HTTPException(status_code=400, detail="buys body cannot be empty")
+
+    settings = get_settings()
+    broker = get_robinhood_adapter()
+    if not await broker.is_connected():
+        if not await broker.connect():
+            raise HTTPException(status_code=503, detail="RH unreachable")
+
+    async with get_db_context() as db:
+        sleeve = await sleeve_repository.get_by_name(db, name)
+        if not sleeve:
+            raise HTTPException(status_code=404, detail=f"Sleeve {name} not found")
+
+    cleaned: dict[str, float] = {}
+    for sym, dollars in buys.items():
+        d = round(float(dollars), 2)
+        if d > 0:
+            cleaned[sym.upper()] = d
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="No valid buy amounts")
+
+    total_cost = sum(cleaned.values())
+
+    # Guardrail 1: never push the account cash-negative.
+    account = await broker.get_account_info()
+    buying_power = float(account.buying_power) if account else 0.0
+    if total_cost > buying_power + 1e-9:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "insufficient buying power",
+                "requested": round(total_cost, 2),
+                "buying_power": round(buying_power, 2),
+            },
+        )
+
+    # Guardrail 2: AI daily notional cap.
+    if getattr(request.state, "key_scope", "admin") == "ai":
+        ai_check_notional(total_cost)
+
+    workflow = get_approval_workflow()
+    sleeve_mv_before, portfolio_mv = await workflow._compute_sleeve_context(name, log)
+
+    # Guardrail 3: tactical sleeve cap (default 10% of net equity).
+    if name == "tactical" and portfolio_mv:
+        cap = settings.tactical_sleeve_max_pct * portfolio_mv
+        if sleeve_mv_before + total_cost > cap + 1e-9:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "tactical sleeve cap exceeded",
+                    "cap_pct": settings.tactical_sleeve_max_pct,
+                    "cap_dollars": round(cap, 2),
+                    "sleeve_mv_before": round(sleeve_mv_before, 2),
+                    "requested": round(total_cost, 2),
+                },
+            )
+
+    quotes = await broker.get_quotes(list(cleaned.keys()))
+
+    # Split buys larger than max_trade_notional so execution-time safety
+    # checks don't reject them.
+    max_notional = settings.max_trade_notional
+    trades = []
+    for sym, dollars in cleaned.items():
+        quote = quotes.get(sym)
+        price = float(quote.last) if quote and quote.last else 0.0
+        remaining = dollars
+        while remaining > 0:
+            chunk = round(min(remaining, max_notional), 2)
+            trades.append({
+                "symbol": sym,
+                "side": "buy",
+                "notional": chunk,
+                "quantity": None,
+                "proposal_price": price,
+                "delta_weight": 0,
+                "target_weight": 0,
+                "rationale": "Custom buy",
+            })
+            remaining = round(remaining - chunk, 2)
+
+    approval_code = generate_approval_code()
+    requested_at = datetime.now(timezone.utc)
+    expires_at = requested_at + timedelta(minutes=settings.approval_expiry_minutes)
+
+    async with get_db_context() as db:
+        source_event_id = f"custombuy_{approval_code}_{requested_at.timestamp()}"
+        signal, intent, recon = await reconciliation_repository.create_full_chain(
+            db=db,
+            sleeve_id=sleeve.id,
+            source_event_id=source_event_id,
+            event_type="custom_buy",
+            proposed_trades=trades,
+            holdings_snapshot={},
+            target_allocations={},
+        )
+        db_approval = await approval_repository.create(
+            db=db,
+            reconciliation_id=recon.id,
+            approval_code=approval_code,
+            proposed_trades=trades,
+            requested_at=requested_at,
+            expires_at=expires_at,
+        )
+        approval_id = db_approval.id
+
+    if getattr(request.state, "key_scope", "admin") == "ai":
+        ai_record_notional(total_cost)
+
+    bot = get_telegram_bot()
+    request_msg = ApprovalRequest(
+        approval_id=approval_id,
+        reconciliation_id=recon.id,
+        sleeve_name=name,
+        proposed_trades=trades,
+        total_notional=total_cost,
+        approval_code=approval_code,
+        expires_at=expires_at,
+        sleeve_mv_before=sleeve_mv_before,
+        portfolio_mv=portfolio_mv,
+    )
+    message_id = await bot.send_approval_request(request_msg)
+
+    return {
+        "approval_code": approval_code,
+        "approval_id": str(approval_id),
+        "trade_count": len(trades),
+        "estimated_cost": round(total_cost, 2),
         "telegram_message_id": message_id,
     }
 
@@ -1409,67 +1497,12 @@ async def admin_sync_positions_from_rh(
 
 @app.post("/jobs/poll-bravos", response_model=JobResponse, tags=["Jobs"])
 async def job_poll_bravos(force: bool = False, skip_scrape: bool = False):
+    """Retired 2026-10-10: the Bravos signal pipeline is decommissioned.
+
+    The bravos sleeve is being wound down; no new Bravos signals will be
+    processed. See docs/DEPLOY-RETHINK.md.
     """
-    Scheduled job: Check for new Bravos emails and process.
-
-    Called by Cloud Scheduler every 3 hours.
-
-    Args:
-        force: Force processing even if email was already seen
-        skip_scrape: Skip scraping (use cached data)
-    """
-    started_at = datetime.now(timezone.utc)
-    log = structlog.get_logger(__name__).bind(job="poll_bravos", force=force)
-
-    try:
-        log.info("starting_bravos_poll")
-
-        from src.signals.bravos_processor import get_bravos_processor
-
-        processor = get_bravos_processor()
-        result = await processor.check_and_process(
-            force=force,
-            dry_run=False,
-            skip_scrape=skip_scrape,
-        )
-
-        if not result.success:
-            log.error("bravos_poll_failed", error=result.error)
-            await _maybe_alert_gmail_failure(result.error or "")
-            return JobResponse(
-                job="poll_bravos",
-                status="failed",
-                started_at=started_at.isoformat(),
-                completed_at=datetime.now(timezone.utc).isoformat(),
-                error=result.error,
-            )
-
-        log.info(
-            "bravos_poll_completed",
-            new_email=result.new_email,
-            trade_count=result.trade_count,
-        )
-
-        return JobResponse(
-            job="poll_bravos",
-            status="completed",
-            started_at=started_at.isoformat(),
-            completed_at=datetime.now(timezone.utc).isoformat(),
-            results={
-                "new_email": result.new_email,
-                "message_id": result.message_id,
-                "subject": result.subject,
-                "trade_count": result.trade_count,
-                "total_buy": result.total_buy,
-                "total_sell": result.total_sell,
-                "approval_sent": result.approval_sent,
-            },
-        )
-
-    except Exception as e:
-        log.exception("bravos_poll_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
+    raise HTTPException(status_code=410, detail="Bravos pipeline retired")
 
 @app.post("/jobs/execute-queued", response_model=JobResponse, tags=["Jobs"])
 async def job_execute_queued():
